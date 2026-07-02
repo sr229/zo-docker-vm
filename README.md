@@ -36,3 +36,26 @@ Since gVisor restricts the system calls needed for Docker (like `iptables` and s
 
 **Network Layout:**
 - **Host** $\rightarrow$ **SSH Tunnel (Port 2222)** $\rightarrow$ **Guest VM** $\rightarrow$ **Docker Daemon**
+
+## 🧪 Alternative: Native Docker in gVisor
+
+It is possible to run the Docker daemon directly in gVisor without a VM, though this requires specific host-level configurations and involves several compromises.
+
+### Requirements
+To enable native Docker, the gVisor runtime (`runsc`) must be started with the following flags:
+- `--net-raw`
+- `--allow-packet-socket-write`
+
+### Known Compromises & Configuration
+- **Storage**: The containerd image store requires a `tmpfs` mount at `/var/lib/docker` or a snapshotter that supports the gVisor filesystem.
+- **Networking**: Since `iptables` is not supported in gVisor, standard Docker port mapping (`-p`) will not work. Containers must use `--network=host` to expose services.
+
+### VM vs. Native Comparison
+
+| Feature | QEMU VM (Zo-Docker) | Native gVisor |
+| :--- | :--- | :--- |
+| **Setup** | Plug-and-play (via `docker-vm`) | Requires host `runsc` config |
+| **Performance** | Slower (TCG Emulation) | Fast (Native) |
+| **Networking** | Full `iptables` support | Host networking only |
+| **Isolation** | Strong (Hardware Virtualization) | Medium (Syscall Interception) |
+| **Resources** | Higher overhead | Lightweight |
