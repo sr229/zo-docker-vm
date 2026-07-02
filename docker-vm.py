@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Docker ARM64 VM Manager for Zo Computer.
+Docker ARM64 VM Manager.
 
 A single-file, self-contained CLI for managing a Docker-in-QEMU VM on
 top of gVisor. Avoids shell-out wherever a dedicated Python library
@@ -9,10 +9,16 @@ is available; the only external commands invoked are:
   * qemu-img      (disk resize - no pure-Python qcow2 writer)
   * cloud-localds (cloud-init ISO - hybrid ISO 9660 + FAT layout;
                    no stdlib equivalent)
+  * qemu-system-aarch64 + ssh + docker (forwarded to the user as-is)
 
-External Python dependencies (both already on the base image):
+External Python dependencies (both optional; stdlib fallbacks exist):
   * psutil   - process management
   * requests - HTTP downloads with progress
+
+All persistent state lives under a single hidden directory (see
+_paths_for_state()), so nothing is sprinkled into the working directory
+or $HOME. The location is overridable via $DOCKER_VM_STATE_DIR and
+defaults to $XDG_STATE_HOME/docker-vm, or ~/.local/state/docker-vm.
 """
 import argparse
 import json
@@ -39,19 +45,80 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Paths & configuration discovery
 # ---------------------------------------------------------------------------
 
-WORKSPACE = Path("/home/workspace")
-CONFIG_FILE = WORKSPACE / ".docker-vm.json"
-PID_FILE = Path("/var/run/docker-vm.pid")
-LOG_FILE = Path("/dev/shm/docker-vm.log")
+# Well-known UEFI firmware locations, in priority order. The first one that
+# exists is used. Override with $DOCKER_VM_EFI.
+EFI_CANDIDATES = (
+    Path("/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"),  # Debian/Ubuntu
+    Path("/usr/share/AAVMF/AAVMF_CODE.fd"),          # Fedora/RHEL/Arch (aarch64)
+    Path("/opt/homebrew/share/qemu/edk2-aarch64-code.fd"),  # macOS Homebrew
+    Path("/usr/local/share/qemu/edk2-aarch64-code.fd"),      # BSD/Homebrew (linux)
+)
+
+APP_DIR_NAME = "docker-vm"
+
+
+def _state_dir() -> Path:
+    """Return the directory for all persistent state.
+
+    Resolution order:
+      1. $DOCKER_VM_STATE_DIR (if set)
+      2. $XDG_STATE_HOME/docker-vm
+      3. ~/.local/state/docker-vm
+    """
+    override = os.environ.get("DOCKER_VM_STATE_DIR")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / APP_DIR_NAME
+    return Path.home() / ".local" / "state" / APP_DIR_NAME
+
+
+def _workspace() -> Path:
+    """Return the host workspace path (used as the guest mount target).
+
+    Resolution order:
+      1. $DOCKER_VM_WORKSPACE  (preferred override)
+      2. $DOCKER_HOST_WORKSPACE  (back-compat with earlier versions)
+      3. /home/workspace  (canonical Zo Computer workspace)
+    """
+    for key in ("DOCKER_VM_WORKSPACE", "DOCKER_HOST_WORKSPACE"):
+        val = os.environ.get(key)
+        if val:
+            return Path(val).expanduser()
+    return Path("/home/workspace")
+
+
+def _pid_file(state: Path) -> Path:
+    """Pick a writable location for the PID file.
+
+    Prefers $XDG_RUNTIME_DIR (per-user tmpfs), then the state dir.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / f"{APP_DIR_NAME}.pid"
+    return state / "docker-vm.pid"
+
+
+# (EFI source resolution lives in _resolve_efi_source below.)
+
+
+# ---------------------------------------------------------------------------
+# Other constants
+# ---------------------------------------------------------------------------
+
 QEMU_BIN = "qemu-system-aarch64"
 QEMU_PROCESS_NAME = "qemu-system-aarch64"
-EFI_PFLASH = WORKSPACE / "efi-pflash.raw"
-EFI_SOURCE = Path("/usr/share/qemu-efi-aarch64/QEMU_EFI.fd")
-CLOUD_INIT_ISO = WORKSPACE / "cloud-init.iso"
-USER_DATA_FILE = WORKSPACE / "user-data"
+STATE_DIR = _state_dir()
+PID_FILE = _pid_file(STATE_DIR)
+EFI_PFLASH = STATE_DIR / "efi-pflash.raw"
+CLOUD_INIT_ISO = STATE_DIR / "cloud-init.iso"
+USER_DATA_FILE = STATE_DIR / "user-data"
+CONFIG_FILE = STATE_DIR / "config.json"
+LOG_FILE = STATE_DIR / "docker-vm.log"
 
 SSH_TUNNEL_PORT = 2222
 SSH_GUEST_PORT = 22
@@ -69,33 +136,83 @@ DEFAULT_IMAGE_URL = (
 DEFAULT_DISK_SIZE = "50G"
 
 
-DEFAULT_CONFIG: dict[str, Any] = {
-    "image_path": str(WORKSPACE / ".docker-vm" / "image.qcow2"),
-    "image_url": DEFAULT_IMAGE_URL,
-    "disk_size": DEFAULT_DISK_SIZE,
-    "log_file": str(LOG_FILE),
-    "port_forwards": {
-        str(SSH_TUNNEL_PORT): str(SSH_GUEST_PORT),
-    },
-}
+def _default_config() -> dict[str, Any]:
+    workspace = _workspace()
+    return {
+        "image_path": str(STATE_DIR / "image.qcow2"),
+        "image_url": DEFAULT_IMAGE_URL,
+        "disk_size": DEFAULT_DISK_SIZE,
+        "log_file": str(LOG_FILE),
+        "port_forwards": {
+            str(SSH_TUNNEL_PORT): str(SSH_GUEST_PORT),
+        },
+        "workspace": str(workspace),
+    }
+
+
+# Legacy locations we recognise when migrating an old install.
+_LEGACY_CONFIG_CANDIDATES = (
+    Path("/home/workspace/.docker-vm.json"),
+)
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+def _migrate_legacy_config() -> dict[str, Any] | None:
+    """Pick up a config from a pre-XDG location, migrate to new state dir.
+
+    Returns the migrated dict if a legacy config was found, else None.
+    """
+    for legacy in _LEGACY_CONFIG_CANDIDATES:
+        if not legacy.exists():
+            continue
+        try:
+            with legacy.open("r") as f:
+                old = json.load(f) or {}
+        except (json.JSONDecodeError, OSError) as e:
+            print(
+                f"Warning: could not read legacy config at {legacy}: {e}",
+                file=sys.stderr,
+            )
+            continue
+        new = _default_config()
+        # Carry over user-touched values; remap image_path into the new
+        # state dir if it pointed under the old /home/workspace/.docker-vm.
+        for key in ("image_url", "disk_size", "log_file", "port_forwards"):
+            if key in old:
+                new[key] = old[key]
+        old_image = old.get("image_path")
+        if old_image:
+            old_p = Path(old_image)
+            # If the old image is at a non-standard location, keep it where
+            # it is; otherwise relocate it to the new state dir.
+            if old_p.parent == Path("/home/workspace") or old_p.parent == Path("/home/workspace/.docker-vm"):
+                pass  # use new default
+            else:
+                new["image_path"] = old_image
+        return new
+    return None
+
+
 def load_config() -> dict[str, Any]:
-    if not CONFIG_FILE.exists():
-        return DEFAULT_CONFIG.copy()
-    try:
-        with CONFIG_FILE.open("r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"Error reading {CONFIG_FILE}: {e}", file=sys.stderr)
-        sys.exit(1)
-    merged = DEFAULT_CONFIG.copy()
-    merged.update(data or {})
-    return merged
+    if CONFIG_FILE.exists():
+        try:
+            with CONFIG_FILE.open("r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Error reading {CONFIG_FILE}: {e}", file=sys.stderr)
+            sys.exit(1)
+        merged = _default_config()
+        merged.update(data or {})
+        return merged
+    migrated = _migrate_legacy_config()
+    if migrated is not None:
+        save_config(migrated)
+        print(f"Migrated legacy config into {CONFIG_FILE}")
+        return migrated
+    return _default_config()
 
 
 def save_config(config: dict[str, Any]) -> None:
@@ -107,7 +224,7 @@ def save_config(config: dict[str, Any]) -> None:
 def ensure_config() -> dict[str, Any]:
     if CONFIG_FILE.exists():
         return load_config()
-    config = DEFAULT_CONFIG.copy()
+    config = load_config()
     save_config(config)
     print(f"Created default configuration at {CONFIG_FILE}")
     return config
@@ -222,27 +339,6 @@ CLOUD_INIT_USER_DATA = (
 )
 
 
-def _stream_download(resp, dest: Path, total: int) -> None:
-    downloaded = 0
-    chunk = 256 * 1024
-    for piece in resp.iter_content(chunk_size=chunk) if requests is not None else iter(lambda: resp.read(chunk), b""):
-        if not piece:
-            continue
-        dest.write(piece)
-        downloaded += len(piece)
-        if total:
-            pct = downloaded * 100 / total
-            sys.stdout.write(
-                f"\rDownloading {dest.name}: {pct:5.1f}% "
-                f"({downloaded // (1024 * 1024)} MiB / "
-                f"{total // (1024 * 1024)} MiB)"
-            )
-            sys.stdout.flush()
-    if total:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-
 def download_image(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if requests is not None:
@@ -306,13 +402,49 @@ def build_cloud_init_iso(iso_path: Path) -> None:
     )
 
 
-def ensure_efi_pflash() -> Path:
-    if not EFI_SOURCE.exists():
-        print(f"Error: UEFI firmware not found at {EFI_SOURCE}", file=sys.stderr)
+def _resolve_efi_source() -> Path:
+    """Find the aarch64 UEFI firmware image, raising on failure.
+
+    Resolution order:
+      1. $DOCKER_VM_EFI  (if set, must exist)
+      2. EFI_CANDIDATES  (first existing match in the well-known paths)
+
+    Set DOCKER_VM_EFI to override, e.g.:
+        DOCKER_VM_EFI=/path/to/QEMU_EFI.fd docker-vm init
+    """
+    override = os.environ.get("DOCKER_VM_EFI")
+    if override:
+        p = Path(override).expanduser()
+        if p.exists():
+            return p
+        print(f"Error: DOCKER_VM_EFI={p} does not exist.", file=sys.stderr)
         sys.exit(1)
+    for candidate in EFI_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    print(
+        "Error: could not find an aarch64 UEFI firmware image. Tried:",
+        file=sys.stderr,
+    )
+    for c in EFI_CANDIDATES:
+        print(f"  - {c}", file=sys.stderr)
+    print(
+        "Set $DOCKER_VM_EFI to the path of a QEMU_EFI.fd / AAVMF_CODE.fd file.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def ensure_efi_pflash() -> Path:
+    """Copy the aarch64 UEFI firmware into the state dir (idempotent).
+
+    QEMU's pflash must be a writable file it can mmap; we keep a single
+    copy inside $STATE_DIR and reuse it across boots.
+    """
+    src = _resolve_efi_source()
     EFI_PFLASH.parent.mkdir(parents=True, exist_ok=True)
     if not EFI_PFLASH.exists():
-        shutil.copyfile(EFI_SOURCE, EFI_PFLASH)
+        shutil.copyfile(src, EFI_PFLASH)
     return EFI_PFLASH
 
 
@@ -387,9 +519,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("Run 'docker-vm destroy' to start over, or 'docker-vm start' to boot it.")
         return 0
 
-    if not EFI_SOURCE.exists():
-        print(f"Error: UEFI firmware not found at {EFI_SOURCE}", file=sys.stderr)
-        return 1
+    _resolve_efi_source()  # exits with a clear error if no firmware is found
 
     image_url = args.image or config.get("image_url", DEFAULT_IMAGE_URL)
     disk_size = args.size or config.get("disk_size", DEFAULT_DISK_SIZE)
@@ -651,7 +781,7 @@ def cmd_destroy(args: argparse.Namespace) -> int:
 def cmd_env(args: argparse.Namespace) -> int:
     """Print shell commands to set up the environment."""
     print(f"export DOCKER_HOST={DOCKER_HOST_URL}")
-    print(f"export DOCKER_VM_WORKSPACE={WORKSPACE}")
+    print(f"export DOCKER_VM_WORKSPACE={_workspace()}")
     return 0
 
 

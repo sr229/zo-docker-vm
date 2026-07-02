@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Local state / config (the CLI writes these to $XDG_STATE_HOME by default)
+.docker-vm.json
+config.json

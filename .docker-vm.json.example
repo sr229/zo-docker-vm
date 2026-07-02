@@ -1,11 +1,12 @@
 {
-    "image_path": "/home/workspace/debian-arm64.qcow2",
+    "_comment": "Example docker-vm config. Normally this file lives under $XDG_STATE_HOME/docker-vm/config.json (or ~/.local/state/docker-vm/config.json). You should not need to edit it by hand; the CLI manages it.",
+
+    "image_path": "~/.local/state/docker-vm/image.qcow2",
+    "image_url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2",
     "disk_size": "50G",
-    "vm_ip": "localhost",
-    "vm_ssh_port": "2222",
-    "vm_ssh_user": "debian",
-    "vm_ssh_pass": "debian",
-    "docker_host": "ssh://debian@localhost:2222",
-    "log_file": "/tmp/qemu-arm64.log",
-    "port_forwards": {}
+    "log_file": "~/.local/state/docker-vm/docker-vm.log",
+    "port_forwards": {
+        "2222": "22"
+    },
+    "workspace": "/home/workspace"
 }
