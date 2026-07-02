@@ -1,0 +1,11 @@
+{
+    "image_path": "/home/workspace/debian-arm64.qcow2",
+    "disk_size": "50G",
+    "vm_ip": "localhost",
+    "vm_ssh_port": "2222",
+    "vm_ssh_user": "debian",
+    "vm_ssh_pass": "debian",
+    "docker_host": "ssh://debian@localhost:2222",
+    "log_file": "/tmp/qemu-arm64.log",
+    "port_forwards": {}
+}
