@@ -37,25 +37,48 @@ Since gVisor restricts the system calls needed for Docker (like `iptables` and s
 **Network Layout:**
 - **Host** $\rightarrow$ **SSH Tunnel (Port 2222)** $\rightarrow$ **Guest VM** $\rightarrow$ **Docker Daemon**
 
+## ⚙️ Configuration
+
+All configuration is stored in `/home/workspace/.docker-vm.json`. The file is automatically created on first start and persists the state of the VM image and port forwards.
+
+```json
+{
+  "image_path": "/home/workspace/.docker-vm/image.qcow2",
+  "log_file": "/dev/shm/docker-vm.log",
+  "port_forwards": {
+    "8080": "80",
+    "9443": "443"
+  }
+}
+```
+
+* `image_path`: The path to the persistent `qcow2` disk image.
+* `log_file`: Where QEMU's serial output is piped.
+* `port_forwards`: A mapping of `host port -> guest port` used to build QEMU's `hostfwd` arguments at launch.
+
+## 🌐 Networking & Port Forwarding
+
+The guest VM is connected to the outside world using QEMU's built-in user-mode networking (`-netdev user,id=net0`). This mode is chosen because it requires no special host privileges, fitting perfectly inside the gVisor sandbox.
+
+Port forwarding is defined in `.docker-vm.json` and converted dynamically into QEMU's `hostfwd` arguments by the `start-docker-vm.sh` script:
+
+```bash
+# In .docker-vm.json
+"port_forwards": { "8080": "80" }
+
+# Becomes the following QEMU flag
+-netdev user,id=net0,hostfwd=tcp::8080-:80
+```
+
+You can manage forwards at runtime without manually editing the JSON file:
+
+* `docker-vm pf-add 8080 80` — Adds a forwarding from host port `8080` to guest port `80`.
+* `docker-vm pf-rm 8080` — Removes the host port `8080` forwarding.
+* `docker-vm restart` — Required after modifying forwards so the VM is relaunched with the new QEMU arguments.
+
+**Default Port Forwards (reserved by the system):**
+* **2222** -> **22**: The SSH tunnel used by the Docker client (`DOCKER_HOST=ssh://debian@localhost:2222`).
+
 ## 🧪 Alternative: Native Docker in gVisor
 
-It is possible to run the Docker daemon directly in gVisor without a VM, though this requires specific host-level configurations and involves several compromises.
-
-### Requirements
-To enable native Docker, the gVisor runtime (`runsc`) must be started with the following flags:
-- `--net-raw`
-- `--allow-packet-socket-write`
-
-### Known Compromises & Configuration
-- **Storage**: The containerd image store requires a `tmpfs` mount at `/var/lib/docker` or a snapshotter that supports the gVisor filesystem.
-- **Networking**: Since `iptables` is not supported in gVisor, standard Docker port mapping (`-p`) will not work. Containers must use `--network=host` to expose services.
-
-### VM vs. Native Comparison
-
-| Feature | QEMU VM (Zo-Docker) | Native gVisor |
-| :--- | :--- | :--- |
-| **Setup** | Plug-and-play (via `docker-vm`) | Requires host `runsc` config |
-| **Performance** | Slower (TCG Emulation) | Fast (Native) |
-| **Networking** | Full `iptables` support | Host networking only |
-| **Isolation** | Strong (Hardware Virtualization) | Medium (Syscall Interception) |
-| **Resources** | Higher overhead | Lightweight |
+It is possible to run the Docker daemon directly in gVisor without a VM, though this requires specific host-level configuration.
