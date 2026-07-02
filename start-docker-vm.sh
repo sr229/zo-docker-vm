@@ -6,38 +6,38 @@ cd /home/workspace
 # Load configuration from JSON
 CONFIG_FILE=".docker-vm.json"
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: Configuration file $CONFIG_FILE not found!"
+    echo "Error: Configuration file $CONFIG_FILE not found. Please run 'docker-vm start' first."
     exit 1
 fi
 
-IMAGE=$(grep -oP '"image_path":\s*"\K[^"]+' "$CONFIG_FILE")
-BIOS="/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
+# Extract values from JSON using grep/sed to avoid dependencies
+IMAGE_PATH=$(grep -oP '"image_path":\s*"\K[^"]+' "$CONFIG_FILE")
+LOG_FILE=$(grep -oP '"log_file":\s*"\K[^"]+' "$CONFIG_FILE")
 
-if [ ! -f "$IMAGE" ]; then
-    echo "Error: Disk image $IMAGE not found!"
-    exit 1
+# Build hostfwd arguments dynamically from port_forwards
+HOSTFWD_ARGS=""
+PF_BLOCK=$(grep -A 20 '"port_forwards"' "$CONFIG_FILE" | tail -n +2)
+if [ -n "$PF_BLOCK" ]; then
+  echo "$PF_BLOCK" | grep -oP '"[0-9]+":\s*"[0-9]+"' | while IFS= read -r line; do
+    GUEST=$(echo "$line" | grep -oP '"\K[0-9]+(?=":)')
+    HOST=$(echo "$line" | grep -oP ':\s*"\K[0-9]+(?=")')
+    if [ -n "$GUEST" ] && [ -n "$HOST" ]; then
+      HOSTFWD_ARGS="${HOSTFWD_ARGS},hostfwd=tcp::${HOST}-:${GUEST}"
+      echo "Forwarding host $HOST -> guest $GUEST"
+    fi
+  done
 fi
 
-# Build the hostfwd string from the JSON port_forwards object
-# We use jq if available, but to keep it zero-dep we'll use a small python snippet
-HOSTFWD=$(python3 -c "
-import json
-with open('$CONFIG_FILE') as f:
-    config = json.load(f)
-    pf = config.get('port_forwards', {})
-    print(','.join([f'tcp::{host}-:{guest}' for guest, host in pf.items()]))
-")
-
+# Write QEMU logs to a file (-D is the global QEMU debug log)
+echo "Starting QEMU..."
 exec qemu-system-aarch64 \
   -machine virt \
   -cpu cortex-a57 \
-  -m 2G \
-  -bios "$BIOS" \
-  -drive if=none,file="$IMAGE",id=hd0 \
-  -device virtio-blk-device,drive=hd0 \
-  -drive if=none,file=cloud-init.iso,id=cd0 \
-  -device virtio-scsi-device \
-  -device scsi-cd,drive=cd0 \
-  -netdev user,id=net0,hostfwd=$HOSTFWD \
+  -smp 4 \
+  -m 4G \
+  -drive if=pflash,format=raw,readonly=on,file=/home/workspace/efi-pflash.raw \
+  -drive if=virtio,format=qcow2,file="$IMAGE_PATH" \
+  -drive if=virtio,format=raw,file=/home/workspace/cloud-init.iso \
+  -netdev user,id=net0${HOSTFWD_ARGS} \
   -device virtio-net-device,netdev=net0 \
-  -nographic
+  -nographic -serial mon:stdio 2>&1
