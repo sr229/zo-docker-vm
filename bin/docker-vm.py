@@ -70,12 +70,9 @@ def resize_disk(size):
 def init_vm(image_url=None, disk_size="50G"):
     # Check if environment is already initialized
     if CONFIG_PATH.exists() or Path("/home/workspace/debian-arm64.qcow2").exists():
-        print("⚠️  A Docker VM environment already exists.")
-        print("If you want to start a fresh environment, please run 'docker-vm destroy' first.")
-        print("\nIf you just want to ensure the VM is running, please use 'docker-vm status' or 'docker-vm restart'.")
-        sys.exit(0)
+        return False # Already exists
 
-    print("Initializing VM...", end="", flush=True)
+    print("Initializing Docker VM environment...")
     
     if not image_url:
         image_url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
@@ -113,8 +110,8 @@ ssh_pwauth: True
     }
     save_config(config)
     
-    print(" Done!")
-    print("\n✅ Environment initialized. Run 'docker-vm restart' to boot.")
+    print("\n✅ Environment initialized successfully!")
+    return True
 
 def destroy_vm():
     print("Tearing down the Docker VM environment...")
@@ -179,6 +176,19 @@ def remove_port_forward(guest_port):
         print("Please run 'docker-vm restart' to apply the changes.")
     else:
         print(f"No port forward found for port {guest_port}")
+
+def is_vm_running():
+    """Check if the QEMU process is currently running."""
+    try:
+        # Check for qemu-system-aarch64 in the process list
+        result = subprocess.run(
+            ["pgrep", "-f", "qemu-system-aarch64"], 
+            capture_output=True, 
+            text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 def wait_for_docker(timeout=120):
     """Polls the Docker daemon until it responds or timeout is reached."""
@@ -259,7 +269,29 @@ Commands:
             elif args[i] == "--size" and i + 1 < len(args):
                 disk_size = args[i+1]
         
-        init_vm(image_url, disk_size)
+        if init_vm(image_url, disk_size):
+            print("Environment created successfully.")
+        else:
+            print("VM environment already exists.")
+
+        if is_vm_running():
+            print("✅ VM is already running.")
+        else:
+            print("Waiting for VM to start...")
+            # Since it's a Zo managed service, the supervisor will restart it 
+            # if we've just created it or if it was stopped.
+            # We can manually trigger the start script for immediate feedback.
+            run("/bin/bash /home/workspace/start-docker-vm.sh")
+            # Then wait for it to be ready
+            # (Reuse the wait_for_docker logic or just a simple check)
+            import time
+            for i in range(10):
+                if is_vm_running():
+                    print("✅ VM is now running!")
+                    break
+                time.sleep(2)
+            else:
+                print("⚠️  VM is taking longer than expected to start. Check 'docker-vm logs'.")
 
     elif command == "status":
         health = get_vm_health()
