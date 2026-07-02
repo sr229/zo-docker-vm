@@ -192,6 +192,16 @@ def _migrate_legacy_config() -> dict[str, Any] | None:
                 pass  # use new default
             else:
                 new["image_path"] = old_image
+        # Stash the old file (renamed) so it isn't accidentally re-migrated
+        # on subsequent runs. The user can delete the .bak if they want.
+        backup = legacy.with_suffix(legacy.suffix + ".bak")
+        try:
+            legacy.rename(backup)
+        except OSError as e:
+            print(
+                f"Warning: could not move legacy config aside at {legacy}: {e}",
+                file=sys.stderr,
+            )
         return new
     return None
 
@@ -209,6 +219,7 @@ def load_config() -> dict[str, Any]:
         return merged
     migrated = _migrate_legacy_config()
     if migrated is not None:
+        migrated["_migrated"] = True
         save_config(migrated)
         print(f"Migrated legacy config into {CONFIG_FILE}")
         return migrated
@@ -222,10 +233,17 @@ def save_config(config: dict[str, Any]) -> None:
 
 
 def ensure_config() -> dict[str, Any]:
+    """Load the config, creating a default one if nothing exists yet.
+
+    First run will print a single "Created" line. Migration from a legacy
+    config prints its own "Migrated" line via ``load_config``.
+    """
     if CONFIG_FILE.exists():
         return load_config()
     config = load_config()
     save_config(config)
+    if config.get("_migrated"):
+        return config
     print(f"Created default configuration at {CONFIG_FILE}")
     return config
 
