@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 import json
+import time
 
 CONFIG_PATH = Path("/home/workspace/.docker-vm.json")
 
@@ -15,8 +16,8 @@ def save_config(config):
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=4)
 
-def run(cmd, args=None, env=None):
-    """Helper to run shell commands and stream output."""
+def run(cmd, args=None, env=None, capture_output=True):
+    """Helper to run shell commands. Captures output by default."""
     full_cmd = cmd
     if args:
         full_cmd = f"{cmd} {' '.join(args)}"
@@ -26,42 +27,45 @@ def run(cmd, args=None, env=None):
         current_env.update(env)
         
     try:
+        # Special case for interactive shells
+        if "ssh" in cmd and "shell" in cmd: # This is a bit loose, better to handle in main
+             pass
+
         process = subprocess.Popen(
             full_cmd, 
             shell=True, 
             env=current_env, 
-            stdout=subprocess.PIPE if "logs" in cmd else None,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
             text=True
         )
         
-        if "logs" in cmd:
-            # Tail -f style streaming
-            while True:
-                line = process.stdout.readline()
-                if not line:
-                    break
-                print(line, end="")
-        else:
-            process.wait()
-            return process.returncode
+        stdout, stderr = process.communicate()
+        return process.returncode, stdout, stderr
     except Exception as e:
         print(f"Error executing command: {e}")
-        return 1
+        return 1, "", str(e)
+
+def run_interactive(cmd):
+    """Runs a command with inherited stdio for interactive sessions."""
+    subprocess.run(cmd, shell=True)
 
 def resize_disk(size):
     config = load_config()
     image = config["image_path"]
-    print(f"Resizing disk {image} to {size}...")
+    print(f"Resizing disk {image} to {size}...", end="", flush=True)
     
     # 1. Resize the qcow2 file
-    subprocess.run(["qemu-img", "resize", image, size], check=True)
+    rc, _, _ = run("qemu-img resize " + image + " " + size)
     
     # 2. Update config
-    config["disk_size"] = size
-    save_config(config)
-    
-    print("Disk resized. Please run 'docker-vm restart' to apply changes.")
-    print("Note: File system expansion will happen automatically on boot if configured, or manually via 'docker-vm expand'.")
+    if rc == 0:
+        config["disk_size"] = size
+        save_config(config)
+        print(" Done!")
+        print("Please run 'docker-vm restart' to apply changes.")
+    else:
+        print(" Failed!")
 
 def init_vm(image_url=None, disk_size="50G"):
     # Check if environment is already initialized
@@ -71,7 +75,7 @@ def init_vm(image_url=None, disk_size="50G"):
         print("\nIf you just want to ensure the VM is running, please use 'docker-vm status' or 'docker-vm restart'.")
         sys.exit(0)
 
-    print("Initializing Docker VM environment...")
+    print("Initializing VM...", end="", flush=True)
     
     if not image_url:
         image_url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
@@ -80,11 +84,9 @@ def init_vm(image_url=None, disk_size="50G"):
     iso_path = "/home/workspace/cloud-init.iso"
     
     # 1. Download Image
-    print(f"Downloading image from {image_url}...")
-    subprocess.run(["curl", "-L", image_url, "-o", image_path], check=True)
+    subprocess.run(["curl", "-L", image_url, "-o", image_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     # 2. Setup Cloud-Init
-    print("Generating cloud-init configuration...")
     user_data = """#cloud-config
 password: debian
 chpasswd: { expire: False }
@@ -93,11 +95,10 @@ ssh_pwauth: True
     with open("/home/workspace/user-data", "w") as f:
         f.write(user_data)
     
-    subprocess.run(["cloud-localds", iso_path, "/home/workspace/user-data"], check=True)
+    subprocess.run(["cloud-localds", iso_path, "/home/workspace/user-data"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     # 3. Resize Image
-    print(f"Setting disk size to {disk_size}...")
-    subprocess.run(["qemu-img", "resize", image_path, disk_size], check=True)
+    subprocess.run(["qemu-img", "resize", image_path, disk_size], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     # 4. Update Config
     config = {
@@ -112,8 +113,8 @@ ssh_pwauth: True
     }
     save_config(config)
     
-    print("\n✅ Environment initialized successfully!")
-    print("Run 'docker-vm restart' to boot the new environment.")
+    print(" Done!")
+    print("\n✅ Environment initialized. Run 'docker-vm restart' to boot.")
 
 def destroy_vm():
     print("Tearing down the Docker VM environment...")
@@ -179,6 +180,46 @@ def remove_port_forward(guest_port):
     else:
         print(f"No port forward found for port {guest_port}")
 
+def wait_for_docker(timeout=120):
+    """Polls the Docker daemon until it responds or timeout is reached."""
+    print("Waiting for VM...", end="", flush=True)
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        status = run("docker info", env={"DOCKER_HOST": load_config()["docker_host"]}, capture_output=True)
+        if status[0] == 0:
+            print("\nVM is Ready!")
+            return True
+        print(".", end="", flush=True)
+        time.sleep(5)
+    print("\n❌ Timeout: VM did not respond in time.")
+    return False
+
+def get_vm_health():
+    """Detailed health check of the VM layers."""
+    config = load_config()
+    health = {
+        "process": False,
+        "ssh": False,
+        "docker": False
+    }
+    
+    # 1. Check if process is running
+    proc_check = subprocess.run("pgrep -f qemu-system-aarch64", shell=True)
+    health["process"] = (proc_check.returncode == 0)
+    
+    # 2. Check SSH connectivity
+    ssh_check = subprocess.run(
+        f"sshpass -p {config['vm_ssh_pass']} ssh -p {config['vm_ssh_port']} -o StrictHostKeyChecking=no -o ConnectTimeout=2 {config['vm_ssh_user']}@{config['vm_ip']} 'echo 1'", 
+        shell=True
+    )
+    health["ssh"] = (ssh_check.returncode == 0)
+    
+    # 3. Check Docker API
+    docker_check = run("docker info", env={"DOCKER_HOST": config["docker_host"]}, capture_output=True)
+    health["docker"] = (docker_check[0] == 0)
+    
+    return health
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] == "help":
@@ -221,18 +262,26 @@ Commands:
         init_vm(image_url, disk_size)
 
     elif command == "status":
-        print("Checking Docker daemon status...")
-        config = load_config()
-        status = run("docker info", env={"DOCKER_HOST": config["docker_host"]})
-        if status == 0:
+        health = get_vm_health()
+        # We no longer print the raw docker info output here
+        print("\n--- VM Health Report ---")
+        print(f"Process: {'✅' if health['process'] else '❌'}")
+        print(f"SSH:     {'✅' if health['ssh'] else '❌'}")
+        print(f"Docker:  {'✅' if health['docker'] else '❌'}")
+        
+        if health["docker"]:
             print("\n✅ Docker VM is healthy and responding!")
+        elif health["process"] and not health["ssh"]:
+            print("\n⚠️  VM process is running, but SSH is not responding. Still booting?")
+        elif not health["process"]:
+            print("\n❌ VM process is not running. Try 'docker-vm restart'.")
         else:
-            print("\n❌ Docker VM is not responding. Try 'docker-vm restart'.")
+            print("\n❌ VM is partially healthy. Check 'docker-vm logs'.")
 
     elif command == "shell":
         config = load_config()
         cmd = f"sshpass -p {config['vm_ssh_pass']} ssh -p {config['vm_ssh_port']} -o StrictHostKeyChecking=no {config['vm_ssh_user']}@{config['vm_ip']}"
-        run(cmd)
+        run_interactive(cmd)
 
     elif command == "docker":
         docker_args = args[1:]
@@ -240,11 +289,13 @@ Commands:
             print("Please provide a docker command. Example: docker-vm docker ps")
             sys.exit(1)
         config = load_config()
-        run("docker", docker_args, env={"DOCKER_HOST": config["docker_host"]})
+        # For 'docker' command, we WANT the output
+        run("docker " + " ".join(docker_args), env={"DOCKER_HOST": config["docker_host"]}, capture_output=False)
 
     elif command == "logs":
         config = load_config()
-        run(f"tail -f {config['log_file']}")
+        # Logs should be streaming
+        subprocess.run(f"tail -f {config['log_file']}", shell=True)
 
     elif command == "pf":
         if len(args) < 2:
@@ -284,14 +335,16 @@ Commands:
             sys.exit(1)
 
     elif command == "restart":
-        print("Restarting VM service...")
         run("pkill -f qemu-system-aarch64")
-        print("Service will be auto-restarted by Zo in a few seconds.")
+        if wait_for_docker():
+            pass 
+        else:
+            print("\n❌ Restart failed. Check 'docker-vm logs'.")
 
     elif command == "stop":
-        print("Stopping VM service...")
+        print("Stopping VM...", end="", flush=True)
         run("pkill -f qemu-system-aarch64")
-        print("VM process stopped. Note: Zo may auto-restart it.")
+        print(" Done.")
 
     elif command == "destroy":
         destroy_vm()
