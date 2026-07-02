@@ -4,14 +4,21 @@ Zo-Docker allows you to run a full Docker daemon inside a Zo Computer sandbox by
 
 ## 🚀 Quick Start
 
-1. **Install the tool**: (Currently pre-installed in this workspace)
-2. **Start the VM**:
+1. **Install the tool**: The whole manager is one Python file. Symlink it onto your `PATH`:
    ```bash
-   docker-vm start
+   ln -sf /home/workspace/zo-docker-vm/docker-vm.py /usr/local/bin/docker-vm
    ```
-3. **Use Docker**:
+2. **Initialize the VM** (downloads the ARM64 cloud image and prepares cloud-init):
    ```bash
-   export DOCKER_HOST=ssh://debian@localhost:2222
+   docker-vm init
+   ```
+3. **Start the VM** and wait for it to come up:
+   ```bash
+   docker-vm start --wait
+   ```
+4. **Use Docker**:
+   ```bash
+   eval "$(docker-vm env)"
    docker run hello-world
    ```
 
@@ -19,47 +26,45 @@ Zo-Docker allows you to run a full Docker daemon inside a Zo Computer sandbox by
 
 | Command | Description |
 | :--- | :--- |
-| `docker-vm start` | Initialize and start the VM |
+| `docker-vm init [--image URL] [--size SIZE] [--force]` | Download image, prepare cloud-init ISO |
+| `docker-vm start [--wait]` | Boot the VM (`--wait` blocks until SSH is ready) |
 | `docker-vm stop` | Stop the VM |
-| `docker-vm restart` | Restart the VM |
-| `docker-vm status` | Check if Docker is healthy |
-| `docker-vm shell` | SSH into the guest VM |
-| `docker-vm docker <cmd>` | Run a docker command directly |
-| `docker-vm pf-add <guest> <host>` | Add a port forward (e.g., `8080 8080`) |
-| `docker-vm pf-rm <guest>` | Remove a port forward |
+| `docker-vm restart` | Restart the VM (waits for SSH) |
+| `docker-vm status` | Check if the VM and SSH tunnel are up |
+| `docker-vm shell` | Open an interactive SSH shell in the guest |
+| `docker-vm env` | Print `export DOCKER_HOST=...` for the host shell |
+| `docker-vm docker <args...>` | Run a docker command against the VM |
+| `docker-vm logs [-f]` | Show or tail the QEMU log |
+| `docker-vm pf add <host> <guest>` | Add a port forward |
+| `docker-vm pf rm <host>` | Remove a port forward |
+| `docker-vm pf ls` | List port forwards |
 | `docker-vm resize <size>` | Resize the VM disk (e.g., `100G`) |
-| `docker-vm destroy` | Wipe everything and start over |
+| `docker-vm destroy [-y]` | Wipe everything and start over |
+
+## 🏗️ Architecture
+
+`docker-vm.py` is a single self-contained Python file. It deliberately uses dedicated Python libraries instead of shelling out wherever possible:
+
+| Concern | Library | Replaces |
+| :--- | :--- | :--- |
+| Process management | `psutil` | `pkill`, `pgrep`, `kill` |
+| Image downloads | `requests` (fallback: `urllib`) | `curl` |
+| File IO | `pathlib`, `shutil` (stdlib) | `rm`, `cp`, `mkdir` |
+| Networking checks | `socket` (stdlib) | `nc`, `sshpass` |
+| Argument parsing | `argparse` (stdlib) | hand-rolled argv parsing |
+
+The only external commands invoked are `qemu-img` (disk resize) and `cloud-localds` (cloud-init ISO), both of which are tiny tools with no clean Python equivalents. QEMU itself is launched via `subprocess.Popen` and its PID is tracked in `/var/run/docker-vm.pid`.
+
+**Network Layout:**
+- **Host** → **SSH Tunnel (Port 2222)** → **Guest VM** → **Docker Daemon**
 
 ## 🛡️ How it Works
 
 Since gVisor restricts the system calls needed for Docker (like `iptables` and specific mounts), Zo-Docker emulates an entire ARM64 machine. The Docker daemon runs inside this VM, and the host communicates with it via a secure SSH tunnel.
 
-All management is consolidated into a single Python entry point: `docker_vm.py`. The `docker-vm` command in `PATH` and the legacy `start-docker-vm.sh` are both symlinks to this same script, so there is exactly one source of truth.
-
-**Network Layout:**
-- **Host** $\rightarrow$ **SSH Tunnel (Port 2222)** $\rightarrow$ **Guest VM** $\rightarrow$ **Docker Daemon**
-
-## 🐍 Architecture (Python)
-
-The project is built around `docker_vm.py`, a pure-Python CLI (using only the standard library) that:
-
-- **Parses `.docker-vm.json`** natively with `json` instead of `grep/sed`, eliminating quoting pitfalls.
-- **Manages the QEMU process** with `subprocess.Popen` and a PID file at `/var/run/docker-vm.pid`.
-- **Builds QEMU arguments** dynamically from the `port_forwards` config map.
-- **Exposes the full subcommand set** via `argparse` (`start`, `stop`, `restart`, `status`, `shell`, `docker`, `pf-add`, `pf-rm`, `resize`, `destroy`).
-
-**File layout:**
-
-| Path | Purpose |
-| :--- | :--- |
-| `docker_vm.py` | Single Python source of truth for the CLI and QEMU launcher. |
-| `start-docker-vm.sh` | Symlink to `docker_vm.py` (backwards compatibility). |
-| `/usr/local/bin/docker-vm` | Symlink to `docker_vm.py` (the documented `docker-vm ...` command). |
-| `.docker-vm.json` | Persisted configuration (image path, log file, port forwards). |
-
 ## ⚙️ Configuration
 
-All configuration is stored in `/home/workspace/.docker-vm.json`. The file is automatically created on first start and persists the state of the VM image and port forwards.
+All configuration is stored in `/home/workspace/.docker-vm.json`. The file is automatically created on first run and persists the state of the VM image, log file, and port forwards.
 
 ```json
 {
@@ -67,8 +72,7 @@ All configuration is stored in `/home/workspace/.docker-vm.json`. The file is au
   "log_file": "/dev/shm/docker-vm.log",
   "port_forwards": {
     "2222": "22",
-    "8080": "80",
-    "9443": "443"
+    "8080": "80"
   }
 }
 ```
@@ -76,30 +80,3 @@ All configuration is stored in `/home/workspace/.docker-vm.json`. The file is au
 * `image_path`: The path to the persistent `qcow2` disk image.
 * `log_file`: Where QEMU's serial and debug output is piped.
 * `port_forwards`: A mapping of `host port -> guest port` used to build QEMU's `hostfwd` arguments at launch.
-
-## 🌐 Networking & Port Forwarding
-
-The guest VM is connected to the outside world using QEMU's built-in user-mode networking (`-netdev user,id=net0`). This mode is chosen because it requires no special host privileges, fitting perfectly inside the gVisor sandbox.
-
-Port forwarding is defined in `.docker-vm.json` and converted dynamically into QEMU's `hostfwd` arguments by `docker_vm.py` at launch:
-
-```python
-# In .docker-vm.json
-"port_forwards": { "8080": "80" }
-
-# Becomes the following QEMU flag
--netdev user,id=net0,hostfwd=tcp::8080-:80
-```
-
-You can manage forwards at runtime without manually editing the JSON file:
-
-* `docker-vm pf-add 8080 80` — Adds a forwarding from host port `8080` to guest port `80`.
-* `docker-vm pf-rm 8080` — Removes the host port `8080` forwarding.
-* `docker-vm restart` — Required after modifying forwards so the VM is relaunched with the new QEMU arguments.
-
-**Default Port Forwards (reserved by the system):**
-* **2222** -> **22**: The SSH tunnel used by the Docker client (`DOCKER_HOST=ssh://debian@localhost:2222`).
-
-## 🧪 Alternative: Native Docker in gVisor
-
-It is possible to run the Docker daemon directly in gVisor without a VM, though this requires specific host-level configuration.

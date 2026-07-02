@@ -1,2 +1,1 @@
-#!/bin/bash
-python3 /home/workspace/bin/docker-vm.py "$@"
+/home/workspace/zo-docker-vm/docker-vm.py
