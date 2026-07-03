@@ -93,7 +93,9 @@ def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
 def test_pf_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())
 
-    rc = docker_vm.main(["pf", "add", "8080", "80"])
+    # New order: pf add <guest> [<host>]
+    # So to map host 8080 to guest 80:
+    rc = docker_vm.main(["pf", "add", "80", "8080"])
     assert rc == 0
     config = docker_vm.load_config()
     assert config["port_forwards"]["8080"] == "80"
@@ -216,3 +218,28 @@ def test_env_command():
         assert "export DOCKER_HOST=" in stdout.getvalue()
     finally:
         sys.stdout = sys.__stdout__
+
+
+def test_port_collision_resolution(monkeypatch):
+    # Mock _is_port_available to simulate port 2222 is busy
+    def fake_is_port_available(port):
+        if port == 2222:
+            return False
+        return True
+
+    monkeypatch.setattr(docker_vm, "_is_port_available", fake_is_port_available)
+
+    port = docker_vm._find_available_port(2222)
+    assert port == 2223
+
+
+def test_build_qemu_command_with_collision(state_dir, monkeypatch):
+    config = docker_vm._default_config()
+    config["port_forwards"] = {"2222": 22}
+
+    # Mock _is_port_available: 2222 busy, 2223 free
+    monkeypatch.setattr(docker_vm, "_is_port_available", lambda p: p != 2222)
+
+    cmd, resolved = docker_vm.build_qemu_command(config)
+    assert resolved["22"] == 2223
+    assert "hostfwd=tcp::2223-:22" in " ".join(cmd)
