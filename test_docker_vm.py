@@ -61,8 +61,9 @@ def test_migrate_legacy_config(mock_state_dir, tmp_path, monkeypatch):
     assert not legacy_path.exists()
     assert Path(str(legacy_path) + ".bak").exists()
 
+@patch("shutil.which", return_value="/usr/bin/qemu-img")
 @patch("subprocess.run")
-def test_qemu_img_resize(mock_run):
+def test_qemu_img_resize(mock_run, mock_which):
     docker_vm.qemu_img_resize(Path("test.qcow2"), "10G")
     mock_run.assert_called_once_with(["qemu-img", "resize", "test.qcow2", "10G"], check=True)
 
@@ -108,6 +109,12 @@ def test_cmd_status_running(mock_docker_ready, mock_create_conn, mock_get_pid, m
     args = argparse.Namespace()
     assert docker_vm.cmd_status(args) == 0
 
+@patch("docker_vm._resolve_efi_source", return_value=Path("/tmp/fake_efi"))
+@patch("shutil.copyfile")
+def test_ensure_efi_pflash(mock_copy, mock_resolve, mock_state_dir):
+    docker_vm.ensure_efi_pflash()
+    mock_copy.assert_called_once()
+
 @patch("docker_vm.stop_qemu")
 @patch("docker_vm.load_config")
 @patch("pathlib.Path.exists", return_value=True)
@@ -120,6 +127,14 @@ def test_cmd_destroy(mock_rmtree, mock_unlink, mock_exists, mock_load_config, mo
     assert docker_vm.cmd_destroy(args) == 0
     assert mock_stop.called
     assert mock_unlink.called
+
+@patch("shutil.which", return_value="/usr/bin/cloud-localds")
+@patch("subprocess.run")
+def test_build_cloud_init_iso(mock_run, mock_which, mock_state_dir):
+    iso_path = mock_state_dir / "cloud-init.iso"
+    docker_vm.build_cloud_init_iso(iso_path)
+    assert (mock_state_dir / "user-data").exists()
+    mock_run.assert_called_once()
 
 @patch("subprocess.Popen")
 @patch("docker_vm.get_qemu_pid", return_value=None)
