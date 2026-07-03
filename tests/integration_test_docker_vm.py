@@ -51,7 +51,15 @@ def test_init_integration(state_dir, workspace, monkeypatch):
         subprocess.run(["qemu-img", "create", "-f", "qcow2", str(dummy_image), "1M"], check=True)
 
     with monkeypatch.context() as m:
-        m.setattr(docker_vm, "download_image", lambda url, dest: subprocess.run(["cp", str(dummy_image), str(dest)], check=True))
+        def fake_download(url, dest):
+            if url.endswith(".gz"):
+                import gzip
+                with gzip.open(dest, "wb") as f:
+                    f.write(b"EXTENDED CONTENT TO MAKE IT AT LEAST 1M" * 100)
+            else:
+                subprocess.run(["cp", str(dummy_image), str(dest)], check=True)
+
+        m.setattr(docker_vm, "download_image", fake_download)
 
         rc = docker_vm.main(["init", "--size", "2M"])
         assert rc == 0
@@ -64,6 +72,23 @@ def test_init_integration(state_dir, workspace, monkeypatch):
     result = subprocess.run(["qemu-img", "info", "--output=json", str(state_dir / "image.qcow2")], capture_output=True, text=True, check=True)
     info = json.loads(result.stdout)
     assert info["virtual-size"] == 2097152
+
+def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
+    with monkeypatch.context() as m:
+        urls_called = []
+        def fake_download(url, dest):
+            urls_called.append(url)
+            import gzip
+            with gzip.open(dest, "wb") as f:
+                f.write(b"SHORTHAND CONTENT")
+
+        m.setattr(docker_vm, "download_image", fake_download)
+
+        rc = docker_vm.main(["init", "--image", "containerd", "--size", "1M"])
+        assert rc == 0
+
+        assert any("containerd.raw.gz" in url for url in urls_called)
+        assert (state_dir / "image.qcow2").exists()
 
 def test_pf_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())

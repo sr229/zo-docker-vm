@@ -122,17 +122,24 @@ LOG_FILE = STATE_DIR / "docker-vm.log"
 
 SSH_TUNNEL_PORT = 2222
 SSH_GUEST_PORT = 22
-SSH_USER = "debian"
-SSH_PASS = "debian"
+SSH_USER = "ubuntu"
+SSH_PASS = "ubuntu"
 DOCKER_HOST_URL = f"ssh://{SSH_USER}@localhost:{SSH_TUNNEL_PORT}"
 
 BOOT_TIMEOUT_S = 90
 BOOT_POLL_INTERVAL_S = 1.0
 
 DEFAULT_IMAGE_URL = (
-    "https://cloud.debian.org/images/cloud/bookworm/latest/"
-    "debian-12-generic-arm64.qcow2"
+    "https://github.com/abiosoft/colima-core/releases/download/"
+    "v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz"
 )
+COLIMA_IMAGE_VERSION = "v0.10.4"
+COLIMA_IMAGE_SHORTHANDS = {
+    "docker": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
+    "containerd": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-containerd.raw.gz",
+    "incus": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-incus.raw.gz",
+    "none": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-none.raw.gz",
+}
 DEFAULT_DISK_SIZE = "50G"
 
 
@@ -363,6 +370,12 @@ CLOUD_INIT_USER_DATA = (
     f"password: {SSH_PASS}\n"
     "chpasswd: { expire: False }\n"
     "ssh_pwauth: True\n"
+    "groups:\n"
+    "  - docker\n"
+    "system_info:\n"
+    "  default_user:\n"
+    f"    name: {SSH_USER}\n"
+    "    groups: [docker]\n"
 )
 
 
@@ -594,11 +607,34 @@ def cmd_init(args: argparse.Namespace) -> int:
     _resolve_efi_source()  # exits with a clear error if no firmware is found
 
     image_url = args.image or config.get("image_url", DEFAULT_IMAGE_URL)
+    if image_url in COLIMA_IMAGE_SHORTHANDS:
+        image_url = COLIMA_IMAGE_SHORTHANDS[image_url]
+
     disk_size = args.size or config.get("disk_size", DEFAULT_DISK_SIZE)
 
     if not image_path.exists():
-        print(f"Downloading {image_url}")
-        download_image(image_url, image_path)
+        if image_url.endswith(".gz"):
+            gz_path = image_path.with_suffix(image_path.suffix + ".gz")
+            print(f"Downloading {image_url}")
+            download_image(image_url, gz_path)
+            print(f"Decompressing {gz_path}...")
+            import gzip
+            with gzip.open(gz_path, "rb") as f_in:
+                # We decompress to a temporary raw file first
+                raw_path = image_path.with_suffix(".raw")
+                with raw_path.open("wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+            print(f"Converting raw image to qcow2...")
+            subprocess.run(
+                ["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(raw_path), str(image_path)],
+                check=True
+            )
+            raw_path.unlink()
+            gz_path.unlink()
+        else:
+            print(f"Downloading {image_url}")
+            download_image(image_url, image_path)
 
     print("Preparing EFI pflash...")
     ensure_efi_pflash()
