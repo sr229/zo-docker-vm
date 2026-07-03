@@ -133,6 +133,13 @@ DEFAULT_IMAGE_URL = (
     "https://github.com/abiosoft/colima-core/releases/download/"
     "v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz"
 )
+COLIMA_IMAGE_VERSION = "v0.10.4"
+COLIMA_IMAGE_SHORTHANDS = {
+    "docker": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
+    "containerd": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-containerd.raw.gz",
+    "incus": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-incus.raw.gz",
+    "none": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-none.raw.gz",
+}
 DEFAULT_DISK_SIZE = "50G"
 
 
@@ -600,6 +607,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     _resolve_efi_source()  # exits with a clear error if no firmware is found
 
     image_url = args.image or config.get("image_url", DEFAULT_IMAGE_URL)
+    if image_url in COLIMA_IMAGE_SHORTHANDS:
+        image_url = COLIMA_IMAGE_SHORTHANDS[image_url]
+
     disk_size = args.size or config.get("disk_size", DEFAULT_DISK_SIZE)
 
     if not image_path.exists():

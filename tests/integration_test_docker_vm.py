@@ -73,6 +73,23 @@ def test_init_integration(state_dir, workspace, monkeypatch):
     info = json.loads(result.stdout)
     assert info["virtual-size"] == 2097152
 
+def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
+    with monkeypatch.context() as m:
+        urls_called = []
+        def fake_download(url, dest):
+            urls_called.append(url)
+            import gzip
+            with gzip.open(dest, "wb") as f:
+                f.write(b"SHORTHAND CONTENT")
+
+        m.setattr(docker_vm, "download_image", fake_download)
+
+        rc = docker_vm.main(["init", "--image", "containerd", "--size", "1M"])
+        assert rc == 0
+
+        assert any("containerd.raw.gz" in url for url in urls_called)
+        assert (state_dir / "image.qcow2").exists()
+
 def test_pf_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())
 
