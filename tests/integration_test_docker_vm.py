@@ -51,7 +51,15 @@ def test_init_integration(state_dir, workspace, monkeypatch):
         subprocess.run(["qemu-img", "create", "-f", "qcow2", str(dummy_image), "1M"], check=True)
 
     with monkeypatch.context() as m:
-        m.setattr(docker_vm, "download_image", lambda url, dest: subprocess.run(["cp", str(dummy_image), str(dest)], check=True))
+        def fake_download(url, dest):
+            if url.endswith(".gz"):
+                import gzip
+                with gzip.open(dest, "wb") as f:
+                    f.write(b"EXTENDED CONTENT TO MAKE IT AT LEAST 1M" * 100)
+            else:
+                subprocess.run(["cp", str(dummy_image), str(dest)], check=True)
+
+        m.setattr(docker_vm, "download_image", fake_download)
 
         rc = docker_vm.main(["init", "--size", "2M"])
         assert rc == 0
