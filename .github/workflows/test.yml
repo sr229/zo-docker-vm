@@ -17,11 +17,21 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Install dependencies
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-utils cloud-image-utils
+
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install psutil requests pytest pytest-mock
 
+    - name: Create dummy image for integration tests
+      run: |
+        mkdir -p tests
+        qemu-img create -f qcow2 tests/dummy.qcow2 1M
+
     - name: Run tests
       run: |
-        pytest test_docker_vm.py
+        pytest tests/integration_test_docker_vm.py
