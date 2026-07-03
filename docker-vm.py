@@ -266,14 +266,23 @@ def _qemu_processes() -> list:
     if psutil is None:
         return []
     found = []
+    config = load_config()
+    image_path = str(Path(config.get("image_path", "")).expanduser())
+
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
             name = (proc.info.get("name") or "").lower()
-            cmdline = " ".join(proc.info.get("cmdline") or [])
+            cmdline_list = proc.info.get("cmdline") or []
+            cmdline = " ".join(cmdline_list)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+
+        # Check if it's a QEMU process and if it's using our specific image
         if QEMU_PROCESS_NAME in name or QEMU_PROCESS_NAME in cmdline:
-            found.append(proc)
+            if image_path and any(image_path in arg for arg in cmdline_list):
+                found.append(proc)
+            elif not image_path:
+                found.append(proc)
     return found
 
 
@@ -359,53 +368,70 @@ CLOUD_INIT_USER_DATA = (
 
 def download_image(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if requests is not None:
-        with requests.get(url, stream=True, timeout=30, allow_redirects=True) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length") or 0)
-            with dest.open("wb") as f:
-                # Inline streamer that writes to an open handle
-                downloaded = 0
-                chunk = 256 * 1024
-                for piece in resp.iter_content(chunk_size=chunk):
-                    if not piece:
-                        continue
-                    f.write(piece)
-                    downloaded += len(piece)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if requests is not None:
+                with requests.get(url, stream=True, timeout=60, allow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    with dest.open("wb") as f:
+                        downloaded = 0
+                        chunk = 256 * 1024
+                        for piece in resp.iter_content(chunk_size=chunk):
+                            if not piece:
+                                continue
+                            f.write(piece)
+                            downloaded += len(piece)
+                            if total:
+                                pct = downloaded * 100 / total
+                                sys.stdout.write(
+                                    f"\rDownloading {dest.name}: {pct:5.1f}% "
+                                    f"({downloaded // (1024 * 1024)} MiB / "
+                                    f"{total // (1024 * 1024)} MiB)"
+                                )
+                                sys.stdout.flush()
+                        if total:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                return
+            else:
+                req = urllib.request.Request(url, headers={"User-Agent": "zo-docker-vm/1.0"})
+                # Increase timeout for the initial connection.
+                # Subsequent reads have their own timeout in the loop if needed,
+                # but urlopen's timeout covers the whole operation in some versions
+                # or just the connection in others.
+                with urllib.request.urlopen(req, timeout=60) as resp, dest.open("wb") as f:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    downloaded = 0
+                    chunk = 256 * 1024
+                    while True:
+                        piece = resp.read(chunk)
+                        if not piece:
+                            break
+                        f.write(piece)
+                        downloaded += len(piece)
+                        if total:
+                            pct = downloaded * 100 / total
+                            sys.stdout.write(
+                                f"\rDownloading {dest.name}: {pct:5.1f}% "
+                                f"({downloaded // (1024 * 1024)} MiB / "
+                                f"{total // (1024 * 1024)} MiB)"
+                            )
+                            sys.stdout.flush()
                     if total:
-                        pct = downloaded * 100 / total
-                        sys.stdout.write(
-                            f"\rDownloading {dest.name}: {pct:5.1f}% "
-                            f"({downloaded // (1024 * 1024)} MiB / "
-                            f"{total // (1024 * 1024)} MiB)"
-                        )
+                        sys.stdout.write("\n")
                         sys.stdout.flush()
-                if total:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-        return
-    req = urllib.request.Request(url, headers={"User-Agent": "zo-docker-vm/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp, dest.open("wb") as f:
-        total = int(resp.headers.get("Content-Length") or 0)
-        downloaded = 0
-        chunk = 256 * 1024
-        while True:
-            piece = resp.read(chunk)
-            if not piece:
-                break
-            f.write(piece)
-            downloaded += len(piece)
-            if total:
-                pct = downloaded * 100 / total
-                sys.stdout.write(
-                    f"\rDownloading {dest.name}: {pct:5.1f}% "
-                    f"({downloaded // (1024 * 1024)} MiB / "
-                    f"{total // (1024 * 1024)} MiB)"
-                )
-                sys.stdout.flush()
-        if total:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+                return
+        except (Exception, KeyboardInterrupt) as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            if attempt < max_retries - 1:
+                print(f"\nDownload failed: {e}. Retrying ({attempt + 2}/{max_retries})...")
+                time.sleep(2)
+            else:
+                print(f"\nError: Failed to download {url} after {max_retries} attempts.")
+                raise
 
 
 def build_cloud_init_iso(iso_path: Path) -> None:
@@ -506,21 +532,49 @@ def build_qemu_command(config: dict[str, Any]) -> list[str]:
     ]
 
 
+def _check_docker_ready() -> bool:
+    """Check if the Docker daemon is responding via the SSH tunnel."""
+    try:
+        env = os.environ.copy()
+        env["DOCKER_HOST"] = DOCKER_HOST_URL
+        # We use 'docker version' as a lightweight health check
+        result = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
 def _wait_for_ssh(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
     """Poll the SSH port until the guest is accepting connections."""
     deadline = time.time() + timeout_s
     attempt = 0
     started = time.time()
+    ssh_ready = False
     while time.time() < deadline:
         attempt += 1
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+        if not ssh_ready:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                    ssh_ready = True
+                    print(f"  SSH port {port} is open. Waiting for Docker daemon...")
+            except OSError:
+                pass
+
+        if ssh_ready:
+            if _check_docker_ready():
                 return True
-        except OSError:
-            pass
+
         if attempt % 10 == 0:
             elapsed = int(time.time() - started)
-            print(f"  still waiting for guest SSH... ({elapsed}s)")
+            status = "waiting for SSH port..." if not ssh_ready else "waiting for Docker daemon..."
+            print(f"  still {status} ({elapsed}s)")
+
         time.sleep(BOOT_POLL_INTERVAL_S)
     return False
 
@@ -583,6 +637,18 @@ def cmd_start(args: argparse.Namespace) -> int:
     pid = get_qemu_pid()
     if pid is not None:
         print(f"Docker VM is already running (PID {pid}).")
+        if args.wait:
+            if _check_docker_ready():
+                print("Docker daemon is already ready.")
+                return 0
+            else:
+                print("Docker VM is running but daemon is not yet ready. Waiting...")
+                if _wait_for_ssh(SSH_TUNNEL_PORT):
+                    print("Docker VM is up and ready.")
+                    return 0
+                else:
+                    print("Warning: Docker daemon did not become ready in time.")
+                    return 1
         return 0
 
     cmd = build_qemu_command(config)
@@ -599,23 +665,33 @@ def cmd_start(args: argparse.Namespace) -> int:
     finally:
         log_handle.close()
 
+    # Give QEMU a moment to fail if it's going to
+    time.sleep(1)
+    if proc.poll() is not None:
+        print(f"Error: QEMU failed to start with return code {proc.returncode}.")
+        print(f"Check logs at {log_path}")
+        return 1
+
     write_pid_file(proc.pid)
     print(f"QEMU started with PID {proc.pid}. Logs: {log_path}")
 
     if args.wait:
-        print(f"Waiting up to {BOOT_TIMEOUT_S}s for guest SSH on port {SSH_TUNNEL_PORT}...")
+        print(f"Waiting up to {BOOT_TIMEOUT_S}s for guest to be ready...")
         if _wait_for_ssh(SSH_TUNNEL_PORT):
-            print("Docker VM is up and accepting SSH connections.")
+            print("Docker VM is up and ready.")
             return 0
-        print("Warning: guest SSH did not come up in time. Check logs.")
+        print("Warning: guest did not become ready in time. Check logs.")
         return 1
     return 0
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    stop_qemu()
-    print("Docker VM stopped.")
-    return 0
+    if stop_qemu():
+        print("Docker VM stopped.")
+        return 0
+    else:
+        print("Error: Docker VM failed to stop.")
+        return 1
 
 
 def cmd_restart(args: argparse.Namespace) -> int:
@@ -631,15 +707,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("Docker VM is not running.")
         return 1
     print(f"Docker VM is running (PID {pid}).")
+
+    ssh_open = False
     try:
         with socket.create_connection(("127.0.0.1", SSH_TUNNEL_PORT), timeout=2.0):
             print("SSH tunnel: open")
+            ssh_open = True
     except OSError:
         print("SSH tunnel: not yet accepting connections")
-        return 1
-    print("Docker daemon: reachable via")
+
+    if ssh_open:
+        if _check_docker_ready():
+            print("Docker daemon: ready")
+        else:
+            print("Docker daemon: not yet responding")
+
+    print("Docker daemon reachable via:")
     print(f"  export DOCKER_HOST={DOCKER_HOST_URL}")
-    return 0
+
+    return 0 if (pid and ssh_open) else 1
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
