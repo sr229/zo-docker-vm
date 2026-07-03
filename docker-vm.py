@@ -126,6 +126,9 @@ SSH_USER = "ubuntu"
 SSH_PASS = "ubuntu"
 DOCKER_HOST_URL = f"ssh://{SSH_USER}@localhost:{SSH_TUNNEL_PORT}"
 
+# Runtime state for the currently running VM
+STATE_FILE = STATE_DIR / "state.json"
+
 BOOT_TIMEOUT_S = 90
 BOOT_POLL_INTERVAL_S = 1.0
 
@@ -164,8 +167,35 @@ _LEGACY_CONFIG_CANDIDATES = (
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & State
 # ---------------------------------------------------------------------------
+
+def load_state() -> dict[str, Any]:
+    """Load runtime state (ports, etc.) of the running VM."""
+    if STATE_FILE.exists():
+        try:
+            with STATE_FILE.open("r") as f:
+                return json.load(f) or {}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    """Save runtime state."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with STATE_FILE.open("w") as f:
+        json.dump(state, f, indent=2)
+
+
+def clear_state() -> None:
+    """Remove runtime state file."""
+    try:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+    except OSError:
+        pass
+
 
 def _migrate_legacy_config() -> dict[str, Any] | None:
     """Pick up a config from a pre-XDG location, migrate to new state dir.
@@ -329,6 +359,7 @@ def stop_qemu(timeout_s: float = 10.0) -> bool:
     pid = get_qemu_pid()
     if pid is None:
         clear_pid_file()
+        clear_state()
         return True
     print(f"Stopping QEMU (PID {pid})...")
     if psutil is not None:
@@ -358,6 +389,7 @@ def stop_qemu(timeout_s: float = 10.0) -> bool:
             except OSError:
                 pass
     clear_pid_file()
+    clear_state()
     return not _pid_alive(pid)
 
 
@@ -516,19 +548,29 @@ def qemu_img_resize(image: Path, size: str) -> None:
 # QEMU launch
 # ---------------------------------------------------------------------------
 
-def build_qemu_command(config: dict[str, Any]) -> list[str]:
+def build_qemu_command(config: dict[str, Any]) -> tuple[list[str], dict[str, int]]:
+    """Build the QEMU command and resolve port collisions.
+
+    Returns a tuple of (command_list, resolved_port_map).
+    """
     image_path = Path(config["image_path"])
     log_file = Path(config["log_file"])
     port_forwards = config.get("port_forwards", {})
 
+    resolved_forwards = {}
     hostfwd_args = ""
-    for host_port, guest_port in port_forwards.items():
-        hostfwd_args += f",hostfwd=tcp::{host_port}-:{guest_port}"
-        print(f"  forward: host {host_port} -> guest {guest_port}")
+    for preferred_host, guest_port in port_forwards.items():
+        actual_host = _find_available_port(int(preferred_host))
+        resolved_forwards[str(guest_port)] = actual_host
+        hostfwd_args += f",hostfwd=tcp::{actual_host}-:{guest_port}"
+        if actual_host != int(preferred_host):
+            print(f"  forward: host {actual_host} -> guest {guest_port} (preferred port {preferred_host} was busy)")
+        else:
+            print(f"  forward: host {actual_host} -> guest {guest_port}")
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    return [
+    cmd = [
         QEMU_BIN,
         "-machine", "virt",
         "-cpu", "cortex-a57",
@@ -543,49 +585,83 @@ def build_qemu_command(config: dict[str, Any]) -> list[str]:
         "-serial", "mon:stdio",
         "-D", str(log_file),
     ]
+    return cmd, resolved_forwards
+
+
+def _is_port_available(port: int) -> bool:
+    """Check if a local TCP port is available."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _find_available_port(preferred: int) -> int:
+    """Find an available port, starting with the preferred one."""
+    if _is_port_available(preferred):
+        return preferred
+    # Try a few next to it, then let OS pick
+    for p in range(preferred + 1, preferred + 100):
+        if _is_port_available(p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _check_docker_ready() -> bool:
     """Check if the Docker daemon is responding via the SSH tunnel."""
     try:
         env = os.environ.copy()
-        env["DOCKER_HOST"] = DOCKER_HOST_URL
-        # We use 'docker version' as a lightweight health check
+        # Use the port from the runtime state if available
+        runtime_state = load_state()
+        ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
+        docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+
+        env["DOCKER_HOST"] = docker_host
+        # We use 'docker version' as a lightweight health check.
+        # It verifies both the SSH connection and the Docker daemon.
         result = subprocess.run(
             ["docker", "version", "--format", "{{.Server.Version}}"],
             env=env,
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=10  # Increased timeout to be more robust
         )
         return result.returncode == 0 and bool(result.stdout.strip())
     except Exception:
         return False
 
 
-def _wait_for_ssh(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
-    """Poll the SSH port until the guest is accepting connections."""
+def _wait_for_ready(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
+    """Poll the SSH port and Docker daemon until the guest is fully ready."""
     deadline = time.time() + timeout_s
     attempt = 0
     started = time.time()
-    ssh_ready = False
+    ssh_port_open = False
     while time.time() < deadline:
         attempt += 1
-        if not ssh_ready:
+        if not ssh_port_open:
             try:
+                # Check if the forwarded port is accepting connections.
+                # This just means QEMU's user-net is up and the port is bound.
                 with socket.create_connection(("127.0.0.1", port), timeout=1.0):
-                    ssh_ready = True
-                    print(f"  SSH port {port} is open. Waiting for Docker daemon...")
+                    ssh_port_open = True
+                    print(f"  SSH port {port} is open. Waiting for guest OS and Docker daemon...")
             except OSError:
                 pass
 
-        if ssh_ready:
-            if _check_docker_ready():
-                return True
+        # We always check Docker readiness if we're in the loop, but we only
+        # report success if BOTH the port is open and Docker responds.
+        # Docker responds implies SSH is actually working in the guest.
+        if ssh_port_open and _check_docker_ready():
+            return True
 
         if attempt % 10 == 0:
             elapsed = int(time.time() - started)
-            status = "waiting for SSH port..." if not ssh_ready else "waiting for Docker daemon..."
+            status = "waiting for SSH port..." if not ssh_port_open else "waiting for Docker daemon..."
             print(f"  still {status} ({elapsed}s)")
 
         time.sleep(BOOT_POLL_INTERVAL_S)
@@ -596,23 +672,30 @@ def _wait_for_ssh(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
 # Subcommands
 # ---------------------------------------------------------------------------
 
-def cmd_init(args: argparse.Namespace) -> int:
+def _init_vm(
+    image: str | None = None,
+    size: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Download image and prepare cloud-init ISO.
+
+    Returns the updated config.
+    """
     config = ensure_config()
     image_path = Path(config["image_path"])
-    if image_path.exists() and not args.force:
-        print("A Docker VM environment already exists.")
-        print("Run 'docker-vm destroy' to start over, or 'docker-vm start' to boot it.")
-        return 0
+
+    if image_path.exists() and not force:
+        return config
 
     _resolve_efi_source()  # exits with a clear error if no firmware is found
 
-    image_url = args.image or config.get("image_url", DEFAULT_IMAGE_URL)
+    image_url = image or config.get("image_url", DEFAULT_IMAGE_URL)
     if image_url in COLIMA_IMAGE_SHORTHANDS:
         image_url = COLIMA_IMAGE_SHORTHANDS[image_url]
 
-    disk_size = args.size or config.get("disk_size", DEFAULT_DISK_SIZE)
+    disk_size = size or config.get("disk_size", DEFAULT_DISK_SIZE)
 
-    if not image_path.exists():
+    if not image_path.exists() or force:
         if image_url.endswith(".gz"):
             gz_path = image_path.with_suffix(image_path.suffix + ".gz")
             print(f"Downloading {image_url}")
@@ -650,6 +733,18 @@ def cmd_init(args: argparse.Namespace) -> int:
     config["disk_size"] = disk_size
     save_config(config)
 
+    return config
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    config = ensure_config()
+    image_path = Path(config["image_path"])
+    if image_path.exists() and not args.force:
+        print("A Docker VM environment already exists.")
+        print("Run 'docker-vm destroy' to start over, or 'docker-vm start' to boot it.")
+        return 0
+
+    _init_vm(image=args.image, size=args.size, force=args.force)
     print("Environment initialized. Run 'docker-vm start' to boot.")
     return 0
 
@@ -658,9 +753,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     config = ensure_config()
     image_path = Path(config["image_path"])
     if not image_path.exists():
-        print(f"Error: VM image not found at {image_path}.")
-        print("Run 'docker-vm init' to download and prepare an image.")
-        return 1
+        print(f"VM image not found at {image_path}. Initializing...")
+        config = _init_vm()
 
     if not EFI_PFLASH.exists():
         print("EFI pflash missing; rebuilding...")
@@ -670,24 +764,34 @@ def cmd_start(args: argparse.Namespace) -> int:
         print("cloud-init ISO missing; rebuilding...")
         build_cloud_init_iso(CLOUD_INIT_ISO)
 
+    wait = not getattr(args, "no_wait", False)
+
     pid = get_qemu_pid()
     if pid is not None:
         print(f"Docker VM is already running (PID {pid}).")
-        if args.wait:
+        if wait:
             if _check_docker_ready():
                 print("Docker daemon is already ready.")
-                return 0
             else:
+                runtime_state = load_state()
+                ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
                 print("Docker VM is running but daemon is not yet ready. Waiting...")
-                if _wait_for_ssh(SSH_TUNNEL_PORT):
+                if _wait_for_ready(ssh_port):
                     print("Docker VM is up and ready.")
-                    return 0
                 else:
                     print("Warning: Docker daemon did not become ready in time.")
                     return 1
         return 0
 
-    cmd = build_qemu_command(config)
+    cmd, resolved_ports = build_qemu_command(config)
+
+    # Prepare runtime state
+    ssh_port = resolved_ports.get(str(SSH_GUEST_PORT), SSH_TUNNEL_PORT)
+    save_state({
+        "ssh_port": ssh_port,
+        "port_forwards": resolved_ports,
+    })
+
     print("Starting QEMU...")
     log_path = Path(config["log_file"])
     log_handle = log_path.open("ab")
@@ -703,17 +807,18 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     # Give QEMU a moment to fail if it's going to
     time.sleep(1)
-    if proc.poll() is not None:
-        print(f"Error: QEMU failed to start with return code {proc.returncode}.")
+    returncode = proc.poll()
+    if returncode is not None:
+        print(f"Error: QEMU exited prematurely with return code {returncode}.")
         print(f"Check logs at {log_path}")
         return 1
 
     write_pid_file(proc.pid)
     print(f"QEMU started with PID {proc.pid}. Logs: {log_path}")
 
-    if args.wait:
+    if wait:
         print(f"Waiting up to {BOOT_TIMEOUT_S}s for guest to be ready...")
-        if _wait_for_ssh(SSH_TUNNEL_PORT):
+        if _wait_for_ready(ssh_port):
             print("Docker VM is up and ready.")
             return 0
         print("Warning: guest did not become ready in time. Check logs.")
@@ -733,7 +838,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_restart(args: argparse.Namespace) -> int:
     cmd_stop(args)
     time.sleep(1)
-    start_args = argparse.Namespace(wait=True)
+    start_args = argparse.Namespace(no_wait=getattr(args, "no_wait", False))
     return cmd_start(start_args)
 
 
@@ -744,30 +849,44 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 1
     print(f"Docker VM is running (PID {pid}).")
 
+    runtime_state = load_state()
+    ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
+    docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+
     ssh_open = False
     try:
-        with socket.create_connection(("127.0.0.1", SSH_TUNNEL_PORT), timeout=2.0):
-            print("SSH tunnel: open")
+        with socket.create_connection(("127.0.0.1", ssh_port), timeout=2.0):
+            print(f"SSH tunnel (port {ssh_port}): open")
             ssh_open = True
     except OSError:
-        print("SSH tunnel: not yet accepting connections")
+        print(f"SSH tunnel (port {ssh_port}): not yet accepting connections")
 
+    docker_ready = False
     if ssh_open:
-        if _check_docker_ready():
+        docker_ready = _check_docker_ready()
+        if docker_ready:
             print("Docker daemon: ready")
         else:
             print("Docker daemon: not yet responding")
 
     print("Docker daemon reachable via:")
-    print(f"  export DOCKER_HOST={DOCKER_HOST_URL}")
+    print(f"  export DOCKER_HOST={docker_host}")
 
-    return 0 if (pid and ssh_open) else 1
+    forwards = runtime_state.get("port_forwards", {})
+    if forwards:
+        print("Port forwards (HOST -> GUEST):")
+        for g, h in forwards.items():
+            print(f"  {h} -> {g}")
+
+    return 0 if (pid and ssh_open and docker_ready) else 1
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
+    runtime_state = load_state()
+    ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
     cmd = [
         "ssh",
-        "-p", str(SSH_TUNNEL_PORT),
+        "-p", str(ssh_port),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         f"{SSH_USER}@localhost",
@@ -781,8 +900,13 @@ def cmd_docker(args: argparse.Namespace) -> int:
     if not docker_args:
         print("Usage: docker-vm docker <docker args...>", file=sys.stderr)
         return 1
+
+    runtime_state = load_state()
+    ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
+    docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+
     env = os.environ.copy()
-    env["DOCKER_HOST"] = DOCKER_HOST_URL
+    env["DOCKER_HOST"] = docker_host
     return subprocess.call(["docker", *docker_args], env=env)
 
 
@@ -815,14 +939,28 @@ def cmd_logs(args: argparse.Namespace) -> int:
 def cmd_pf_add(args: argparse.Namespace) -> int:
     config = ensure_config()
     forwards = config.setdefault("port_forwards", {})
-    host_port = str(args.host)
     guest_port = str(args.guest)
-    if host_port in forwards:
-        print(f"Host port {host_port} is already forwarded to guest {forwards[host_port]}.")
-        return 0
-    forwards[host_port] = guest_port
+
+    if args.host:
+        host_port = str(args.host)
+        if host_port in forwards:
+            print(f"Host port {host_port} is already forwarded to guest {forwards[host_port]}.")
+            return 0
+        forwards[host_port] = guest_port
+        print(f"Added forward: host {host_port} -> guest {guest_port}.")
+    else:
+        # Check if guest port is already mapped
+        for h, g in forwards.items():
+            if g == guest_port:
+                print(f"Guest port {guest_port} is already forwarded from host {h}.")
+                return 0
+        # If no host port given, we will resolve it at start time (one-to-one or random)
+        # For now, we store it with a special marker or just use guest port as host port
+        # and let the start command handle collisions.
+        forwards[guest_port] = guest_port
+        print(f"Added forward: guest {guest_port} (host port will be resolved at start).")
+
     save_config(config)
-    print(f"Added forward: host {host_port} -> guest {guest_port}.")
     print("Run 'docker-vm restart' to apply the change.")
     return 0
 
@@ -920,7 +1058,11 @@ def cmd_destroy(args: argparse.Namespace) -> int:
 
 def cmd_env(args: argparse.Namespace) -> int:
     """Print shell commands to set up the environment."""
-    print(f"export DOCKER_HOST={DOCKER_HOST_URL}")
+    runtime_state = load_state()
+    ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
+    docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+
+    print(f"export DOCKER_HOST={docker_host}")
     print(f"export DOCKER_VM_WORKSPACE={_workspace()}")
     return 0
 
@@ -943,11 +1085,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=cmd_init)
 
     p_start = sub.add_parser("start", help="Boot the VM")
-    p_start.add_argument("--wait", action="store_true", help="Wait until guest SSH is ready")
+    p_start.add_argument("--no-wait", action="store_true", help="Don't wait for guest to be ready")
     p_start.set_defaults(func=cmd_start)
 
     sub.add_parser("stop", help="Stop the VM").set_defaults(func=cmd_stop)
-    sub.add_parser("restart", help="Restart the VM").set_defaults(func=cmd_restart)
+
+    p_restart = sub.add_parser("restart", help="Restart the VM")
+    p_restart.add_argument("--no-wait", action="store_true", help="Don't wait for guest to be ready")
+    p_restart.set_defaults(func=cmd_restart)
     sub.add_parser("status", help="Check VM and SSH tunnel status").set_defaults(func=cmd_status)
     sub.add_parser("shell", help="Open an interactive SSH shell in the guest").set_defaults(func=cmd_shell)
     sub.add_parser("env", help="Print environment variables for the host shell").set_defaults(func=cmd_env)
@@ -964,8 +1109,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pf_sub = p_pf.add_subparsers(dest="pf_command", required=True)
 
     p_pf_add = p_pf_sub.add_parser("add", help="Add a port forward")
-    p_pf_add.add_argument("host", type=int, help="Host port")
     p_pf_add.add_argument("guest", type=int, help="Guest port")
+    p_pf_add.add_argument("host", type=int, nargs="?", help="Host port (optional)")
     p_pf_add.set_defaults(func=cmd_pf_add)
 
     p_pf_rm = p_pf_sub.add_parser("rm", help="Remove a port forward")

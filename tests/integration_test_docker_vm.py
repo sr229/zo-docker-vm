@@ -93,7 +93,9 @@ def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
 def test_pf_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())
 
-    rc = docker_vm.main(["pf", "add", "8080", "80"])
+    # New order: pf add <guest> [<host>]
+    # So to map host 8080 to guest 80:
+    rc = docker_vm.main(["pf", "add", "80", "8080"])
     assert rc == 0
     config = docker_vm.load_config()
     assert config["port_forwards"]["8080"] == "80"
@@ -156,9 +158,55 @@ def test_start_already_running(state_dir, monkeypatch):
 
     # Mock _pid_alive to simulate it IS running
     monkeypatch.setattr(docker_vm, "_pid_alive", lambda pid: True if pid == 999999 else False)
+    # Mock _check_docker_ready to return True so it doesn't try to wait
+    monkeypatch.setattr(docker_vm, "_check_docker_ready", lambda: True)
 
     rc = docker_vm.main(["start"])
     assert rc == 0 # Should report already running
+
+
+def test_start_auto_init(state_dir, workspace, monkeypatch):
+    docker_vm.save_config(docker_vm._default_config())
+    # image.qcow2 does NOT exist
+
+    with monkeypatch.context() as m:
+        def fake_download(url, dest):
+            import gzip
+            with gzip.open(dest, "wb") as f:
+                f.write(b"DUMMY DATA")
+
+        def fake_run(args, **kwargs):
+            if "convert" in args:
+                Path(args[-1]).touch()
+            return subprocess.CompletedProcess(args, 0)
+
+        m.setattr(subprocess, "run", fake_run)
+        m.setattr(docker_vm, "download_image", fake_download)
+        m.setattr(docker_vm, "download_image", fake_download)
+        m.setattr(docker_vm, "qemu_img_resize", lambda image, size: None)
+        m.setattr(docker_vm, "build_cloud_init_iso", lambda iso: iso.touch())
+        # Mock Popen to avoid actually starting QEMU
+        class FakeProc:
+            def __init__(self, args, **kwargs):
+                self.args = args
+                self.pid = 12345
+                self.returncode = 0
+                self.stdout = None
+                self.stderr = None
+            def poll(self): return None # Return None to simulate still running
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def wait(self, timeout=None): return 0
+            def communicate(self, input=None, timeout=None): return (None, None)
+            def kill(self): pass
+            def terminate(self): pass
+        m.setattr(subprocess, "Popen", FakeProc)
+        m.setattr(docker_vm, "_wait_for_ready", lambda port: True)
+
+        rc = docker_vm.main(["start"])
+        assert rc == 0
+
+    assert (state_dir / "image.qcow2").exists()
 
 def test_env_command():
     from io import StringIO
@@ -170,3 +218,28 @@ def test_env_command():
         assert "export DOCKER_HOST=" in stdout.getvalue()
     finally:
         sys.stdout = sys.__stdout__
+
+
+def test_port_collision_resolution(monkeypatch):
+    # Mock _is_port_available to simulate port 2222 is busy
+    def fake_is_port_available(port):
+        if port == 2222:
+            return False
+        return True
+
+    monkeypatch.setattr(docker_vm, "_is_port_available", fake_is_port_available)
+
+    port = docker_vm._find_available_port(2222)
+    assert port == 2223
+
+
+def test_build_qemu_command_with_collision(state_dir, monkeypatch):
+    config = docker_vm._default_config()
+    config["port_forwards"] = {"2222": 22}
+
+    # Mock _is_port_available: 2222 busy, 2223 free
+    monkeypatch.setattr(docker_vm, "_is_port_available", lambda p: p != 2222)
+
+    cmd, resolved = docker_vm.build_qemu_command(config)
+    assert resolved["22"] == 2223
+    assert "hostfwd=tcp::2223-:22" in " ".join(cmd)
