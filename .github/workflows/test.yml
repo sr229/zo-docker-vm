@@ -20,7 +20,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y qemu-utils cloud-image-utils
+        sudo apt-get install -y qemu-system-aarch64 qemu-utils cloud-image-utils
 
     - name: Install Python dependencies
       run: |

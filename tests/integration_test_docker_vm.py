@@ -27,9 +27,6 @@ def workspace(tmp_path):
 
 @pytest.fixture(autouse=True)
 def setup_env(state_dir, workspace, monkeypatch):
-    # Mock dependency checks for all tests
-    monkeypatch.setattr(docker_vm, "_check_dependencies", lambda: None)
-
     monkeypatch.setenv("DOCKER_VM_STATE_DIR", str(state_dir))
     monkeypatch.setenv("DOCKER_VM_WORKSPACE", str(workspace))
 
