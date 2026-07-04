@@ -28,7 +28,8 @@ Zo-Docker allows you to run a full Docker daemon inside a Zo Computer sandbox. B
 ```
 
 * **Tunnel Port:** Local port `2222` is mapped to guest port `22` (SSH) by default.
-* **Storage Mounting:** Host workspace paths (e.g. `/home/workspace`) are mapped so you can mount host directories directly into containers.
+* **Storage Mounting:** Host workspace paths (e.g. `/home/workspace`) are automatically mapped via Virtio-9p so you can mount host directories directly into containers.
+* **Docker Context:** The VM's Docker socket is exposed locally, allowing you to use native `docker` commands without `DOCKER_HOST` environment variables.
 
 ---
 
@@ -60,13 +61,18 @@ You can interact with the Docker daemon in two ways:
   ```bash
   docker-vm docker run hello-world
   ```
-* **Method B: Via the Native Docker CLI**
-  Set up the host environment variables to route native `docker` commands through the SSH tunnel:
+* **Method B: Via the Native Docker CLI (Context)**
+  Zo-Docker automatically creates a Docker context named `zo-docker`. Simply switch to it:
+  ```bash
+  docker context use zo-docker
+  docker run hello-world
+  ```
+* **Method C: Via Environment Variables**
   ```bash
   eval "$(docker-vm env)"
   docker run hello-world
   ```
-  *Note: To use the native CLI, you must authorize the VM's SSH key. See [SSH Authorization](#-ssh-authorization) below.*
+  *Note: To use the native CLI or context, you must authorize the VM's SSH key. See [SSH Authorization](#-ssh-authorization) below.*
 
 ---
 
@@ -142,6 +148,9 @@ The VM's configuration is managed dynamically in `<state-dir>/config.json`. Exam
 | `pf add` | `<guest_port> [host_port]` | Registers a port forward. If the VM is running, applies it **immediately** via a live SSH tunnel without requiring a restart. |
 | `pf rm` | `<host_port>` | Removes a port forward. If the VM is running, tears down the live tunnel immediately. |
 | `pf ls` | `[--json]` | Lists all active port forward configurations. |
+| `mount add` | `<host_path> <guest_path> [--readonly]` | Registers a directory mount. Requires restart to apply. |
+| `mount rm` | `<guest_path>` | Removes a directory mount. |
+| `mount ls` | `[--json]` | Lists all configured directory mounts. |
 | `resize` | `<size>` | Expands the QEMU disk partition to a larger size (e.g. `100G`). |
 | `destroy` | `[-y/--yes]` | Wipes all state data, configs, and disk files in the state directory. |
 | `shell-setup` | `[--write]` | Prints a shell hook that auto-activates `DOCKER_HOST` when the VM is running. Pass `--write` to append it directly to `~/.bashrc` or `~/.zshrc`. |

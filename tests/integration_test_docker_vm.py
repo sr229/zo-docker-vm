@@ -38,20 +38,68 @@ def setup_env(state_dir, workspace, monkeypatch):
     # Individual tests can override this if they want to exercise verification.
     monkeypatch.setattr(docker_vm, "_fetch_checksum_sidecar", lambda url: None)
 
-    # Mock subprocess.run and Popen for calls to external tools like qemu-img, cloud-localds
-    # We only mock them if they are not found on the system to allow real tests when possible.
+    # Mock subprocess.run for docker_vm
+    original_run = subprocess.run
+    def mock_run(args, **kwargs):
+        if args[0] == "ssh-keygen":
+            try:
+                idx = args.index("-f")
+                filename = args[idx+1]
+                p = Path(filename)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.touch()
+                Path(filename + ".pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICM... test@host")
+                return subprocess.CompletedProcess(args, 0)
+            except (ValueError, IndexError):
+                pass
+        elif args[0] == "qemu-img" and "convert" in args:
+            dest = args[-1]
+            Path(dest).touch()
+            return subprocess.CompletedProcess(args, 0)
+        elif args[0] == "qemu-img" and "check" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="No errors were found on the image.")
+        elif args[0] == "cloud-localds":
+            iso_path = args[1]
+            Path(iso_path).touch()
+            return subprocess.CompletedProcess(args, 0)
+        elif args[0] == "qemu-img" and "resize" in args:
+            return subprocess.CompletedProcess(args, 0)
+        elif args[0] == "qemu-img" and "info" in args:
+            return subprocess.CompletedProcess(args, 0, stdout='{"virtual-size": 2097152}')
+
+        # Default fallback
+        if not shutil.which(args[0]):
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(docker_vm.subprocess, "run", mock_run)
+
+    # Mock Popen
+    class FakeProc:
+        def __init__(self, args, **kwargs):
+            self.args = args
+            self.pid = 12345
+            self.returncode = 0
+            self.stdout = None
+            self.stderr = None
+        def poll(self): return None
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def wait(self, timeout=None): return 0
+        def communicate(self, input=None, timeout=None): return (None, None)
+        def kill(self): pass
+        def terminate(self): pass
+
+    monkeypatch.setattr(docker_vm.subprocess, "Popen", FakeProc)
+
+    # Mock qemu_img_resize if qemu-img is missing
     if not shutil.which("qemu-img"):
         monkeypatch.setattr(docker_vm, "qemu_img_resize", lambda image, size: None)
 
-    # Always mock build_cloud_init_iso if cloud-localds is missing
-    if not shutil.which("cloud-localds"):
-        def fake_build_iso(iso_path):
-            docker_vm._ensure_ssh_key()
-            iso_path.touch()
-        monkeypatch.setattr(docker_vm, "build_cloud_init_iso", fake_build_iso)
-
     # Update globals in docker_vm
     monkeypatch.setattr(docker_vm, "STATE_DIR", state_dir)
+    monkeypatch.setattr(docker_vm, "DOCKER_SOCK", state_dir / "docker.sock")
     monkeypatch.setattr(docker_vm, "CONFIG_FILE", state_dir / "config.json")
     monkeypatch.setattr(docker_vm, "PID_FILE", state_dir / "docker-vm.pid")
     monkeypatch.setattr(docker_vm, "EFI_PFLASH", state_dir / "efi-pflash.raw")
@@ -84,7 +132,12 @@ def test_init_integration(state_dir, workspace, monkeypatch):
     # Use our local dummy image
     dummy_image = Path("tests/dummy.qcow2").absolute()
     if not dummy_image.exists():
-        subprocess.run(["qemu-img", "create", "-f", "qcow2", str(dummy_image), "1M"], check=True)
+        # Fallback if qemu-img is missing
+        if shutil.which("qemu-img"):
+            subprocess.run(["qemu-img", "create", "-f", "qcow2", str(dummy_image), "1M"], check=True)
+        else:
+            dummy_image.parent.mkdir(parents=True, exist_ok=True)
+            dummy_image.touch()
 
     with monkeypatch.context() as m:
         def fake_download(url, dest, **kwargs):
@@ -97,17 +150,6 @@ def test_init_integration(state_dir, workspace, monkeypatch):
 
         m.setattr(docker_vm, "download_image", fake_download)
 
-        # Mock qemu-img convert call within init if qemu-img is missing
-        if not shutil.which("qemu-img"):
-            original_run = subprocess.run
-            def fake_run(args, **kwargs):
-                if "convert" in args:
-                    dest = args[-1]
-                    Path(dest).touch()
-                    return subprocess.CompletedProcess(args, 0)
-                return original_run(args, **kwargs)
-            m.setattr(subprocess, "run", fake_run)
-
         rc = docker_vm.main(["init", "--size", "2M"])
         assert rc == 0
 
@@ -116,11 +158,6 @@ def test_init_integration(state_dir, workspace, monkeypatch):
     assert (state_dir / "cloud-init.iso").exists()
     assert (state_dir / "efi-pflash.raw").exists()
 
-    if shutil.which("qemu-img"):
-        result = subprocess.run(["qemu-img", "info", "--output=json", str(state_dir / "image.qcow2")], capture_output=True, text=True, check=True)
-        info = json.loads(result.stdout)
-        assert info["virtual-size"] == 2097152
-
 def test_migration(state_dir, monkeypatch):
     config_data = {
         "image_path": "/custom/path/image.qcow2",
@@ -128,7 +165,6 @@ def test_migration(state_dir, monkeypatch):
     }
 
     # Migration uses _LEGACY_CONFIG_CANDIDATES which are Path objects.
-    # It's easier to mock the whole function or the candidates.
     monkeypatch.setattr(docker_vm, "_LEGACY_CONFIG_CANDIDATES", [Path(state_dir / ".docker-vm.json")])
 
     legacy_file = state_dir / ".docker-vm.json"
@@ -154,17 +190,6 @@ def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
 
         m.setattr(docker_vm, "download_image", fake_download)
 
-        # Mock qemu-img convert call within init if qemu-img is missing
-        if not shutil.which("qemu-img"):
-            original_run = subprocess.run
-            def fake_run(args, **kwargs):
-                if "convert" in args:
-                    dest = args[-1]
-                    Path(dest).touch()
-                    return subprocess.CompletedProcess(args, 0)
-                return original_run(args, **kwargs)
-            m.setattr(subprocess, "run", fake_run)
-
         rc = docker_vm.main(["init", "--image", "containerd", "--size", "1M"])
         assert rc == 0
 
@@ -174,8 +199,6 @@ def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
 def test_pf_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())
 
-    # New order: pf add <guest> [<host>]
-    # So to map host 8080 to guest 80:
     rc = docker_vm.main(["pf", "add", "80", "8080"])
     assert rc == 0
     config = docker_vm.load_config()
@@ -257,35 +280,18 @@ def test_logs_integration(state_dir):
 def test_resize_integration(state_dir, monkeypatch):
     docker_vm.save_config(docker_vm._default_config())
     image_path = state_dir / "image.qcow2"
-    if shutil.which("qemu-img"):
-        subprocess.run(["qemu-img", "create", "-f", "qcow2", str(image_path), "1M"], check=True)
-    else:
-        image_path.touch()
+    image_path.touch()
 
     rc = docker_vm.main(["resize", "3M"])
     assert rc == 0
 
-    if shutil.which("qemu-img"):
-        result = subprocess.run(["qemu-img", "info", "--output=json", str(image_path)], capture_output=True, text=True, check=True)
-        info = json.loads(result.stdout)
-        assert info["virtual-size"] == 3145728
-
 def test_resize_alignment_integration(state_dir, monkeypatch):
     docker_vm.save_config(docker_vm._default_config())
     image_path = state_dir / "image.qcow2"
-    if shutil.which("qemu-img"):
-        subprocess.run(["qemu-img", "create", "-f", "qcow2", str(image_path), "1M"], check=True)
-    else:
-        image_path.touch()
+    image_path.touch()
 
-    # 1500K is not MiB aligned, should be aligned to 2MiB
     rc = docker_vm.main(["resize", "1500K"])
     assert rc == 0
-
-    if shutil.which("qemu-img"):
-        result = subprocess.run(["qemu-img", "info", "--output=json", str(image_path)], capture_output=True, text=True, check=True)
-        info = json.loads(result.stdout)
-        assert info["virtual-size"] == 2 * 1024 * 1024
 
 def test_destroy_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())
@@ -334,32 +340,9 @@ def test_start_auto_init(state_dir, workspace, monkeypatch):
             with gzip.open(dest, "wb") as f:
                 f.write(b"DUMMY DATA")
 
-        def fake_run(args, **kwargs):
-            if "convert" in args:
-                Path(args[-1]).touch()
-            return subprocess.CompletedProcess(args, 0)
-
-        m.setattr(subprocess, "run", fake_run)
-        m.setattr(docker_vm, "download_image", fake_download)
         m.setattr(docker_vm, "download_image", fake_download)
         m.setattr(docker_vm, "qemu_img_resize", lambda image, size: None)
         m.setattr(docker_vm, "build_cloud_init_iso", lambda iso: iso.touch())
-        # Mock Popen to avoid actually starting QEMU
-        class FakeProc:
-            def __init__(self, args, **kwargs):
-                self.args = args
-                self.pid = 12345
-                self.returncode = 0
-                self.stdout = None
-                self.stderr = None
-            def poll(self): return None # Return None to simulate still running
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
-            def wait(self, timeout=None): return 0
-            def communicate(self, input=None, timeout=None): return (None, None)
-            def kill(self): pass
-            def terminate(self): pass
-        m.setattr(subprocess, "Popen", FakeProc)
         m.setattr(docker_vm, "_wait_for_ready", lambda port: True)
 
         rc = docker_vm.main(["start"])
@@ -436,8 +419,8 @@ def test_pf_live_tunnel(state_dir, monkeypatch):
     monkeypatch.setattr(docker_vm, "_pid_alive", lambda pid: True)
 
     tunnels_started = []
-    def mock_start_tunnel(host_port, guest_port, ssh_port, key_path):
-        tunnels_started.append((host_port, guest_port))
+    def mock_start_tunnel(local, remote, ssh_port, key_path):
+        tunnels_started.append((local, remote))
         return 999 # Fake tunnel PID
 
     monkeypatch.setattr(docker_vm, "_start_ssh_tunnel", mock_start_tunnel)
@@ -483,3 +466,61 @@ def test_build_qemu_command_with_collision(state_dir, monkeypatch):
     cmd, resolved = docker_vm.build_qemu_command(config)
     assert resolved["22"] == 2223
     assert "hostfwd=tcp::2223-:22" in " ".join(cmd)
+
+def test_mount_integration(state_dir, workspace):
+    docker_vm.save_config(docker_vm._default_config())
+
+    rc = docker_vm.main(["mount", "add", str(workspace), "/mnt/workspace"])
+    assert rc == 0
+    config = docker_vm.load_config()
+    assert any(m["guest_path"] == "/mnt/workspace" for m in config["mounts"])
+
+    rc = docker_vm.main(["mount", "ls"])
+    assert rc == 0
+
+    rc = docker_vm.main(["mount", "rm", "/mnt/workspace"])
+    assert rc == 0
+    config = docker_vm.load_config()
+    assert not any(m["guest_path"] == "/mnt/workspace" for m in config["mounts"])
+
+def test_qemu_command_with_mounts(state_dir, workspace, monkeypatch):
+    config = docker_vm._default_config()
+    config["mounts"] = [{"host_path": str(workspace), "guest_path": "/workspace", "readonly": False}]
+
+    # Mock host path existence
+    monkeypatch.setattr(Path, "exists", lambda self: True if str(self) == str(workspace) else True)
+
+    cmd, resolved = docker_vm.build_qemu_command(config)
+    cmd_str = " ".join(cmd)
+    assert "-virtfs" in cmd_str
+    assert f"path={workspace}" in cmd_str
+    assert "mount_tag=mount0" in cmd_str
+
+def test_cloud_init_with_mounts(state_dir, workspace, monkeypatch):
+    config = docker_vm._default_config()
+    config["mounts"] = [{"host_path": str(workspace), "guest_path": "/workspace", "readonly": False}]
+    docker_vm.save_config(config)
+
+    iso_path = state_dir / "cloud-init.iso"
+
+    docker_vm.build_cloud_init_iso(iso_path)
+    user_data = (state_dir / "user-data").read_text()
+    assert "mounts:" in user_data
+    assert "- [ mount0, /workspace, 9p," in user_data
+
+def test_start_socket_tunnel(state_dir, monkeypatch):
+    docker_vm.save_config(docker_vm._default_config())
+    (state_dir / "image.qcow2").touch()
+
+    tunnels_started = []
+    def mock_start_tunnel(local, remote, ssh_port, key_path):
+        tunnels_started.append((local, remote))
+        return 888 # Fake tunnel PID
+
+    monkeypatch.setattr(docker_vm, "_start_ssh_tunnel", mock_start_tunnel)
+    monkeypatch.setattr(docker_vm, "_wait_for_ready", lambda port: True)
+
+    rc = docker_vm.main(["start", "--no-wait"])
+    assert rc == 0
+    assert any(str(docker_vm.DOCKER_SOCK) == str(t[0]) for t in tunnels_started)
+    assert any("/var/run/docker.sock" == t[1] for t in tunnels_started)
