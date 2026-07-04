@@ -324,6 +324,10 @@ def _qemu_processes() -> list:
     found = []
     config = load_config()
     image_path = str(Path(config.get("image_path", "")).expanduser())
+    # This must match the exact -drive value built in build_qemu_command,
+    # so a prefix match (e.g. one state dir path being a prefix of
+    # another) can't misattribute a process.
+    expected_drive_arg = f"if=virtio,format=qcow2,file={image_path}" if image_path else None
 
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
@@ -335,9 +339,9 @@ def _qemu_processes() -> list:
 
         # Check if it's a QEMU process and if it's using our specific image
         if QEMU_PROCESS_NAME in name or QEMU_PROCESS_NAME in cmdline:
-            if image_path and any(image_path in arg for arg in cmdline_list):
+            if expected_drive_arg and expected_drive_arg in cmdline_list:
                 found.append(proc)
-            elif not image_path:
+            elif not expected_drive_arg:
                 found.append(proc)
     return found
 
@@ -689,7 +693,18 @@ def build_qemu_command(config: dict[str, Any]) -> tuple[list[str], dict[str, int
     """
     image_path = Path(config["image_path"])
     log_file = Path(config["log_file"])
-    port_forwards = config.get("port_forwards", {})
+    port_forwards = dict(config.get("port_forwards", {}))
+
+    # The SSH tunnel forward is load-bearing: cmd_start, cmd_shell, cmd_docker,
+    # and _check_docker_ready all assume a forward to SSH_GUEST_PORT exists.
+    # A hand-edited config.json could have dropped it, so make sure it's there.
+    if str(SSH_GUEST_PORT) not in port_forwards.values():
+        port_forwards[str(SSH_TUNNEL_PORT)] = str(SSH_GUEST_PORT)
+        print(
+            f"  Warning: no SSH forward (guest port {SSH_GUEST_PORT}) found in "
+            f"config; adding a default forward on host port {SSH_TUNNEL_PORT}.",
+            file=sys.stderr,
+        )
 
     resolved_forwards = {}
     hostfwd_args = ""
@@ -834,6 +849,26 @@ def _wait_for_ready(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
     return False
 
 
+def _qemu_img_check(path: Path) -> bool:
+    """Run 'qemu-img check' on a disk image; True if it looks healthy.
+
+    If qemu-img isn't available we can't check, so we don't block on it
+    (dependency presence is already enforced elsewhere via _check_dependencies).
+    """
+    try:
+        result = subprocess.run(
+            ["qemu-img", "check", str(path)],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return True
+    if result.returncode != 0:
+        print(f"qemu-img check failed for {path}:\n{result.stdout}{result.stderr}", file=sys.stderr)
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -875,23 +910,36 @@ def _init_vm(
 
         if image_url.endswith(".gz"):
             gz_path = image_path.with_suffix(image_path.suffix + ".gz")
-            print(f"Downloading {image_url}")
-            download_image(image_url, gz_path, checksum=checksum)
-            print(f"Decompressing {gz_path}...")
-            import gzip
-            with gzip.open(gz_path, "rb") as f_in:
-                # We decompress to a temporary raw file first
-                raw_path = image_path.with_suffix(".raw")
-                with raw_path.open("wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
+            raw_path = image_path.with_suffix(".raw")
+            try:
+                print(f"Downloading {image_url}")
+                download_image(image_url, gz_path, checksum=checksum)
+                print(f"Decompressing {gz_path}...")
+                import gzip
+                with gzip.open(gz_path, "rb") as f_in:
+                    # We decompress to a temporary raw file first
+                    with raw_path.open("wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
 
-            print(f"Converting raw image to qcow2...")
-            subprocess.run(
-                ["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(raw_path), str(image_path)],
-                check=True
-            )
-            raw_path.unlink()
-            gz_path.unlink()
+                print(f"Converting raw image to qcow2...")
+                subprocess.run(
+                    ["qemu-img", "convert", "-f", "raw", "-O", "qcow2", str(raw_path), str(image_path)],
+                    check=True
+                )
+
+                print("Verifying converted image...")
+                if not _qemu_img_check(image_path):
+                    image_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"{image_path} failed integrity check after conversion; "
+                        "the source download was likely truncated or corrupt. "
+                        "Try 'docker-vm init --force' again."
+                    )
+            finally:
+                # Always clean up intermediates, even on failure, so a
+                # retry doesn't get confused by stale partial files.
+                raw_path.unlink(missing_ok=True)
+                gz_path.unlink(missing_ok=True)
         else:
             print(f"Downloading {image_url}")
             download_image(image_url, image_path, checksum=checksum)
