@@ -715,6 +715,29 @@ def _check_docker_ready() -> bool:
         return False
 
 
+def _check_dependencies() -> None:
+    """Ensure all required external commands are installed."""
+    deps = {
+        QEMU_BIN: "qemu-system-aarch64 (part of qemu-system-arm)",
+        "qemu-img": "qemu-img (part of qemu-utils)",
+        "cloud-localds": "cloud-localds (part of cloud-image-utils)",
+        "ssh": "ssh (part of openssh-client)",
+        "docker": "docker (part of docker.io)",
+    }
+    missing = []
+    for cmd, pkg in deps.items():
+        if not shutil.which(cmd):
+            missing.append(pkg)
+
+    if missing:
+        print("Error: The following required dependencies are missing:", file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        print("\nPlease install them using your package manager, e.g.:", file=sys.stderr)
+        print("  sudo apt install qemu-system-arm qemu-utils cloud-image-utils openssh-client docker.io", file=sys.stderr)
+        sys.exit(1)
+
+
 def _wait_for_ready(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
     """Poll the SSH port and Docker daemon until the guest is fully ready."""
     deadline = time.time() + timeout_s
@@ -817,6 +840,7 @@ def _init_vm(
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    _check_dependencies()
     config = ensure_config()
     image_path = Path(config["image_path"])
     if image_path.exists() and not args.force:
@@ -830,6 +854,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    _check_dependencies()
     config = ensure_config()
     image_path = Path(config["image_path"])
     if not image_path.exists():
