@@ -1133,7 +1133,9 @@ def cmd_resize(args: argparse.Namespace) -> int:
 
 
 def cmd_destroy(args: argparse.Namespace) -> int:
-    stop_qemu()
+    if not stop_qemu():
+        print("Error: Could not stop the VM. Aborting destroy to prevent data corruption.")
+        return 1
     config = load_config()
     image_path = Path(config["image_path"])
 
@@ -1190,8 +1192,11 @@ def cmd_env(args: argparse.Namespace) -> int:
 
     print(f"export DOCKER_HOST={docker_host}")
     print(f"export DOCKER_VM_WORKSPACE={_workspace()}")
-    print(f"# To use the local docker client without a password, run:")
-    print(f"# ssh-add {key_path}")
+    print("#")
+    print("# To trust the VM host key and enable passwordless access from host CLI, run:")
+    print(f'# ssh-keygen -R "[localhost]:{ssh_port}" 2>/dev/null')
+    print(f"# ssh-keyscan -p {ssh_port} localhost >> ~/.ssh/known_hosts 2>/dev/null")
+    print(f"# ssh-add {key_path} 2>/dev/null")
     return 0
 
 
