@@ -21,6 +21,7 @@ or $HOME. The location is overridable via $DOCKER_VM_STATE_DIR and
 defaults to $XDG_STATE_HOME/docker-vm, or ~/.local/state/docker-vm.
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -142,7 +143,6 @@ LOG_FILE = STATE_DIR / "docker-vm.log"
 SSH_TUNNEL_PORT = 2222
 SSH_GUEST_PORT = 22
 SSH_USER = "ubuntu"
-SSH_PASS = "ubuntu"
 DOCKER_HOST_URL = f"ssh://{SSH_USER}@localhost:{SSH_TUNNEL_PORT}"
 
 # Runtime state for the currently running VM
@@ -418,19 +418,67 @@ def stop_qemu(timeout_s: float = 10.0) -> bool:
 
 CLOUD_INIT_USER_DATA = (
     "#cloud-config\n"
-    f"password: {SSH_PASS}\n"
-    "chpasswd: { expire: False }\n"
-    "ssh_pwauth: True\n"
+    # Password auth is intentionally disabled: the state-dir SSH keypair
+    # (see _ensure_ssh_key) is the only way in. This also means a locked,
+    # unguessable password is fine since it can never be used to log in.
+    "ssh_pwauth: False\n"
+    "lock_passwd: True\n"
     "groups:\n"
     "  - docker\n"
     "system_info:\n"
     "  default_user:\n"
     f"    name: {SSH_USER}\n"
     "    groups: [docker]\n"
+    "    lock_passwd: True\n"
 )
 
 
-def download_image(url: str, dest: Path) -> None:
+def _fetch_checksum_sidecar(url: str) -> tuple[str, str] | None:
+    """Try to fetch a checksum sidecar file for ``url``.
+
+    colima-core (and many other release pipelines) publish a
+    ``<asset>.sha512sum`` file alongside each release asset. Returns
+    ``(algo, expected_hex_digest)`` on success, or None if no sidecar
+    exists or it couldn't be parsed. Callers should treat None as
+    "integrity cannot be verified", not as an error.
+    """
+    sidecar_url = url + ".sha512sum"
+    try:
+        if requests is not None:
+            resp = requests.get(sidecar_url, timeout=15)
+            if resp.status_code != 200:
+                return None
+            text = resp.text
+        else:
+            req = urllib.request.Request(sidecar_url, headers={"User-Agent": "zo-docker-vm/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    # Sidecar format is typically "<hex digest>  <filename>", but be
+    # lenient and just scan tokens for something that looks like a digest.
+    algo_by_len = {128: "sha512", 64: "sha256", 40: "sha1"}
+    for token in text.split():
+        token = token.strip().lower()
+        if len(token) in algo_by_len and all(c in "0123456789abcdef" for c in token):
+            return algo_by_len[len(token)], token
+    return None
+
+
+def _verify_checksum(path: Path, algo: str, expected_hex: str) -> bool:
+    h = hashlib.new(algo)
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    actual = h.hexdigest().lower()
+    if actual != expected_hex.lower():
+        print(f"Checksum mismatch: expected {expected_hex}, got {actual}", file=sys.stderr)
+        return False
+    return True
+
+
+def download_image(url: str, dest: Path, checksum: tuple[str, str] | None = None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     max_retries = 3
     for attempt in range(max_retries):
@@ -458,6 +506,12 @@ def download_image(url: str, dest: Path) -> None:
                         if total:
                             sys.stdout.write("\n")
                             sys.stdout.flush()
+                if checksum:
+                    algo, expected_hex = checksum
+                    print(f"Verifying {algo} checksum...")
+                    if not _verify_checksum(dest, algo, expected_hex):
+                        raise ValueError(f"{dest.name} failed {algo} checksum verification")
+                    print("Checksum OK.")
                 return
             else:
                 req = urllib.request.Request(url, headers={"User-Agent": "zo-docker-vm/1.0"})
@@ -486,6 +540,12 @@ def download_image(url: str, dest: Path) -> None:
                     if total:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
+                if checksum:
+                    algo, expected_hex = checksum
+                    print(f"Verifying {algo} checksum...")
+                    if not _verify_checksum(dest, algo, expected_hex):
+                        raise ValueError(f"{dest.name} failed {algo} checksum verification")
+                    print("Checksum OK.")
                 return
         except (Exception, KeyboardInterrupt) as e:
             if isinstance(e, KeyboardInterrupt):
@@ -802,10 +862,21 @@ def _init_vm(
     disk_size = size or config.get("disk_size", DEFAULT_DISK_SIZE)
 
     if not image_path.exists() or force:
+        print("Looking up checksum for integrity verification...")
+        checksum = _fetch_checksum_sidecar(image_url)
+        if checksum:
+            print(f"  found {checksum[0]} sidecar.")
+        else:
+            print(
+                "  Warning: no checksum sidecar found for this image URL; "
+                "downloaded image cannot be verified for integrity.",
+                file=sys.stderr,
+            )
+
         if image_url.endswith(".gz"):
             gz_path = image_path.with_suffix(image_path.suffix + ".gz")
             print(f"Downloading {image_url}")
-            download_image(image_url, gz_path)
+            download_image(image_url, gz_path, checksum=checksum)
             print(f"Decompressing {gz_path}...")
             import gzip
             with gzip.open(gz_path, "rb") as f_in:
@@ -823,7 +894,7 @@ def _init_vm(
             gz_path.unlink()
         else:
             print(f"Downloading {image_url}")
-            download_image(image_url, image_path)
+            download_image(image_url, image_path, checksum=checksum)
 
     print("Preparing EFI pflash...")
     ensure_efi_pflash()

@@ -34,6 +34,10 @@ def setup_env(state_dir, workspace, monkeypatch):
     # Mock _check_dependencies to avoid failing on missing system tools in test environment
     monkeypatch.setattr(docker_vm, "_check_dependencies", lambda: None)
 
+    # Checksum sidecar lookup hits the network; keep tests offline/deterministic.
+    # Individual tests can override this if they want to exercise verification.
+    monkeypatch.setattr(docker_vm, "_fetch_checksum_sidecar", lambda url: None)
+
     # Mock subprocess.run and Popen for calls to external tools like qemu-img, cloud-localds
     # We only mock them if they are not found on the system to allow real tests when possible.
     if not shutil.which("qemu-img"):
@@ -83,7 +87,7 @@ def test_init_integration(state_dir, workspace, monkeypatch):
         subprocess.run(["qemu-img", "create", "-f", "qcow2", str(dummy_image), "1M"], check=True)
 
     with monkeypatch.context() as m:
-        def fake_download(url, dest):
+        def fake_download(url, dest, **kwargs):
             if url.endswith(".gz"):
                 import gzip
                 with gzip.open(dest, "wb") as f:
@@ -120,7 +124,7 @@ def test_init_integration(state_dir, workspace, monkeypatch):
 def test_init_shorthand_integration(state_dir, workspace, monkeypatch):
     with monkeypatch.context() as m:
         urls_called = []
-        def fake_download(url, dest):
+        def fake_download(url, dest, **kwargs):
             urls_called.append(url)
             import gzip
             with gzip.open(dest, "wb") as f:
@@ -259,7 +263,7 @@ def test_start_auto_init(state_dir, workspace, monkeypatch):
     # image.qcow2 does NOT exist
 
     with monkeypatch.context() as m:
-        def fake_download(url, dest):
+        def fake_download(url, dest, **kwargs):
             import gzip
             with gzip.open(dest, "wb") as f:
                 f.write(b"DUMMY DATA")
