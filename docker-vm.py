@@ -529,11 +529,25 @@ def ensure_efi_pflash() -> Path:
 
     QEMU's pflash must be a writable file it can mmap; we keep a single
     copy inside $STATE_DIR and reuse it across boots.
+
+    On aarch64 'virt' machines, QEMU expects the pflash to be exactly 64MiB.
     """
     src = _resolve_efi_source()
     EFI_PFLASH.parent.mkdir(parents=True, exist_ok=True)
+
+    # If it exists but is not 64MiB, we force a re-copy/pad.
+    size_64mib = 64 * 1024 * 1024
+    if EFI_PFLASH.exists() and EFI_PFLASH.stat().st_size != size_64mib:
+        EFI_PFLASH.unlink()
+
     if not EFI_PFLASH.exists():
-        shutil.copyfile(src, EFI_PFLASH)
+        with src.open("rb") as f_src, EFI_PFLASH.open("wb") as f_dst:
+            shutil.copyfileobj(f_src, f_dst)
+            current_size = f_dst.tell()
+            if current_size < size_64mib:
+                f_dst.write(b"\0" * (size_64mib - current_size))
+            elif current_size > size_64mib:
+                print(f"Warning: EFI source {src} is larger than 64MiB ({current_size} bytes). QEMU might fail.", file=sys.stderr)
     return EFI_PFLASH
 
 
@@ -541,7 +555,37 @@ def qemu_img_resize(image: Path, size: str) -> None:
     if not shutil.which("qemu-img"):
         print("Error: qemu-img is not installed.", file=sys.stderr)
         sys.exit(1)
-    subprocess.run(["qemu-img", "resize", str(image), size], check=True)
+
+    # QEMU and many storage backends prefer 1MiB alignment.
+    # We attempt to align absolute sizes to the next MiB.
+    aligned_size = size
+    try:
+        import re
+        # Match simple absolute sizes like "50G", "1024M", "2000000".
+        # Skip relative sizes like "+1G" or "-500M".
+        m = re.match(r'^(\d+)([KMGTP]?)(B?)$', size, re.IGNORECASE)
+        if m:
+            val, unit, _ = m.groups()
+            val = int(val)
+            unit = unit.upper()
+            mult = {
+                "": 1,
+                "K": 1024,
+                "M": 1024**2,
+                "G": 1024**3,
+                "T": 1024**4,
+                "P": 1024**5,
+            }
+            if unit in mult:
+                bytes_val = val * mult[unit]
+                mib = 1024 * 1024
+                if bytes_val % mib != 0:
+                    new_bytes = ((bytes_val + mib - 1) // mib) * mib
+                    aligned_size = str(new_bytes)
+    except Exception:
+        pass
+
+    subprocess.run(["qemu-img", "resize", str(image), aligned_size], check=True)
 
 
 # ---------------------------------------------------------------------------

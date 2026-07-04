@@ -44,6 +44,22 @@ def setup_env(state_dir, workspace, monkeypatch):
     fake_efi.write_bytes(b"EFI CONTENT")
     monkeypatch.setenv("DOCKER_VM_EFI", str(fake_efi))
 
+def test_efi_padding(state_dir, monkeypatch):
+    # Fake EFI
+    fake_efi = state_dir / "FAKE_EFI_SOURCE.fd"
+    fake_efi.write_bytes(b"A" * 1024 * 1024) # 1MiB
+    monkeypatch.setenv("DOCKER_VM_EFI", str(fake_efi))
+
+    pflash = docker_vm.ensure_efi_pflash()
+    assert pflash.exists()
+    assert pflash.stat().st_size == 64 * 1024 * 1024
+
+    # Test that it detects wrong size and re-pads
+    pflash.unlink()
+    pflash.write_bytes(b"WRONG SIZE")
+    pflash = docker_vm.ensure_efi_pflash()
+    assert pflash.stat().st_size == 64 * 1024 * 1024
+
 def test_init_integration(state_dir, workspace, monkeypatch):
     # Use our local dummy image
     dummy_image = Path("tests/dummy.qcow2").absolute()
@@ -140,6 +156,19 @@ def test_resize_integration(state_dir):
     result = subprocess.run(["qemu-img", "info", "--output=json", str(image_path)], capture_output=True, text=True, check=True)
     info = json.loads(result.stdout)
     assert info["virtual-size"] == 3145728
+
+def test_resize_alignment_integration(state_dir):
+    docker_vm.save_config(docker_vm._default_config())
+    image_path = state_dir / "image.qcow2"
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(image_path), "1M"], check=True)
+
+    # 1500K is not MiB aligned, should be aligned to 2MiB
+    rc = docker_vm.main(["resize", "1500K"])
+    assert rc == 0
+
+    result = subprocess.run(["qemu-img", "info", "--output=json", str(image_path)], capture_output=True, text=True, check=True)
+    info = json.loads(result.stdout)
+    assert info["virtual-size"] == 2 * 1024 * 1024
 
 def test_destroy_integration(state_dir):
     docker_vm.save_config(docker_vm._default_config())
