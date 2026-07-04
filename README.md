@@ -131,19 +131,20 @@ The VM's configuration is managed dynamically in `<state-dir>/config.json`. Exam
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
 | `init` | `[--image URL/shorthand] [--size SIZE] [--force]` | Downloads the VM cloud image and creates the cloud-init environment. Supported shorthands: `docker` (default), `containerd`, `incus`, `none`. |
-| `start` | `[--no-wait]` | Launches QEMU. Blocks until Docker is ready unless `--no-wait` is supplied. |
-| `stop` | None | Gracefully stops the QEMU process. |
+| `start` | `[--no-wait] [--cpus N] [--memory SIZE]` | Launches QEMU. Blocks until Docker is ready unless `--no-wait` is supplied. CPU and memory settings are persisted to `config.json`. |
+| `stop` | None | Gracefully stops the QEMU process and tears down all live SSH tunnels. |
 | `restart` | `[--no-wait]` | Restarts the VM. |
 | `status` | `[--json]` | Shows whether the VM process, SSH tunnel, and Docker daemon are active. |
 | `shell` | None | Opens an interactive SSH shell inside the guest VM. |
-| `env` | None | Prints shell environment exports (`DOCKER_HOST`, `DOCKER_VM_WORKSPACE`) and prints SSH authorization checks. |
+| `env` | None | Prints shell environment exports (`DOCKER_HOST`, `DOCKER_VM_WORKSPACE`) and warns if the SSH key is not yet authorized. |
 | `docker` | `<args...>` | Wrapper to run any Docker command inside the guest VM. |
 | `logs` | `[-f/--follow]` | Tails the QEMU process serial and debug output log. |
-| `pf add` | `<guest_port> [host_port]` | Registers a new port forward mapping from Host to Guest VM. |
-| `pf rm` | `<host_port>` | Removes an existing port forward. |
+| `pf add` | `<guest_port> [host_port]` | Registers a port forward. If the VM is running, applies it **immediately** via a live SSH tunnel without requiring a restart. |
+| `pf rm` | `<host_port>` | Removes a port forward. If the VM is running, tears down the live tunnel immediately. |
 | `pf ls` | `[--json]` | Lists all active port forward configurations. |
 | `resize` | `<size>` | Expands the QEMU disk partition to a larger size (e.g. `100G`). |
 | `destroy` | `[-y/--yes]` | Wipes all state data, configs, and disk files in the state directory. |
+| `shell-setup` | `[--write]` | Prints a shell hook that auto-activates `DOCKER_HOST` when the VM is running. Pass `--write` to append it directly to `~/.bashrc` or `~/.zshrc`. |
 
 ---
 
@@ -156,3 +157,25 @@ The VM's configuration is managed dynamically in `<state-dir>/config.json`. Exam
 | `DOCKER_VM_EFI` | System search path | Location of the `QEMU_EFI.fd` or `AAVMF_CODE.fd` binary. |
 | `XDG_STATE_HOME` | `~/.local/state` | Parent directory of the default state path. |
 | `XDG_RUNTIME_DIR` | None | Parent directory for PID storage (tmpfs) if set. |
+
+---
+
+## 🖥️ VM Resources
+
+CPU and memory can be configured at start time and are persisted so subsequent starts use the same values:
+
+```bash
+docker-vm start --cpus 8 --memory 8G
+```
+
+Or edit `<state-dir>/config.json` directly:
+
+```json
+{
+  "cpus": 8,
+  "memory": "8G"
+}
+```
+
+Defaults are **4 vCPUs** and **4 GB RAM**.
+

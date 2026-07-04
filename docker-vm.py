@@ -163,6 +163,11 @@ COLIMA_IMAGE_SHORTHANDS = {
     "none": f"https://github.com/abiosoft/colima-core/releases/download/{COLIMA_IMAGE_VERSION}/ubuntu-24.04-minimal-cloudimg-arm64-none.raw.gz",
 }
 DEFAULT_DISK_SIZE = "50G"
+DEFAULT_CPUS = 4
+DEFAULT_MEMORY = "4G"
+
+# State-dir file that tracks live SSH tunnel PIDs for dynamic port forwards.
+TUNNELS_FILE = STATE_DIR / "tunnels.json"
 
 
 def _default_config() -> dict[str, Any]:
@@ -171,6 +176,8 @@ def _default_config() -> dict[str, Any]:
         "image_path": str(STATE_DIR / "image.qcow2"),
         "image_url": DEFAULT_IMAGE_URL,
         "disk_size": DEFAULT_DISK_SIZE,
+        "cpus": DEFAULT_CPUS,
+        "memory": DEFAULT_MEMORY,
         "log_file": str(LOG_FILE),
         "port_forwards": {
             str(SSH_TUNNEL_PORT): str(SSH_GUEST_PORT),
@@ -694,6 +701,8 @@ def build_qemu_command(config: dict[str, Any]) -> tuple[list[str], dict[str, int
     image_path = Path(config["image_path"])
     log_file = Path(config["log_file"])
     port_forwards = dict(config.get("port_forwards", {}))
+    cpus = str(config.get("cpus", DEFAULT_CPUS))
+    memory = str(config.get("memory", DEFAULT_MEMORY))
 
     # The SSH tunnel forward is load-bearing: cmd_start, cmd_shell, cmd_docker,
     # and _check_docker_ready all assume a forward to SSH_GUEST_PORT exists.
@@ -723,8 +732,8 @@ def build_qemu_command(config: dict[str, Any]) -> tuple[list[str], dict[str, int
         QEMU_BIN,
         "-machine", "virt",
         "-cpu", "cortex-a57",
-        "-smp", "4",
-        "-m", "4G",
+        "-smp", cpus,
+        "-m", memory,
         "-drive", f"if=pflash,format=raw,readonly=on,file={EFI_PFLASH}",
         "-drive", f"if=virtio,format=qcow2,file={image_path}",
         "-drive", f"if=virtio,format=raw,file={CLOUD_INIT_ISO}",
@@ -975,6 +984,79 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Dynamic SSH port-forward tunnels
+# ---------------------------------------------------------------------------
+
+def _load_tunnels() -> dict[str, int]:
+    """Load the map of host_port -> ssh-tunnel PID from the tunnels file."""
+    if TUNNELS_FILE.exists():
+        try:
+            return json.loads(TUNNELS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_tunnels(tunnels: dict[str, int]) -> None:
+    TUNNELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TUNNELS_FILE.write_text(json.dumps(tunnels, indent=2))
+
+
+def _start_ssh_tunnel(host_port: int, guest_port: int, ssh_port: int, key_path: Path) -> int | None:
+    """Spawn a background SSH tunnel and return its PID, or None on failure."""
+    cmd = [
+        "ssh",
+        "-N",
+        "-p", str(ssh_port),
+        "-i", str(key_path),
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ExitOnForwardFailure=yes",
+        "-L", f"{host_port}:localhost:{guest_port}",
+        f"{SSH_USER}@localhost",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        # Give it a moment to establish or fail
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            return None
+        return proc.pid
+    except OSError:
+        return None
+
+
+def _stop_ssh_tunnel(pid: int) -> None:
+    """Terminate a background SSH tunnel process."""
+    if _pid_alive(pid):
+        try:
+            if psutil is not None:
+                psutil.Process(pid).terminate()
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except (OSError, Exception):
+            pass
+
+
+def _stop_all_ssh_tunnels() -> None:
+    """Terminate all tracked SSH tunnel processes and clear the tunnels file."""
+    tunnels = _load_tunnels()
+    for host_port, pid in tunnels.items():
+        _stop_ssh_tunnel(pid)
+    try:
+        if TUNNELS_FILE.exists():
+            TUNNELS_FILE.unlink()
+    except OSError:
+        pass
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     _check_dependencies()
     config = ensure_config()
@@ -990,6 +1072,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if not CLOUD_INIT_ISO.exists() or not _ssh_key_path().exists():
         print("cloud-init ISO or SSH key missing; rebuilding...")
         build_cloud_init_iso(CLOUD_INIT_ISO)
+
+    # Apply --cpus/--memory overrides to config before building the command.
+    if getattr(args, "cpus", None) is not None:
+        config["cpus"] = args.cpus
+        save_config(config)
+    if getattr(args, "memory", None) is not None:
+        config["memory"] = args.memory
+        save_config(config)
 
     wait = not getattr(args, "no_wait", False)
 
@@ -1068,6 +1158,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    _stop_all_ssh_tunnels()
     if stop_qemu():
         print("Docker VM stopped.")
         return 0
@@ -1261,14 +1352,32 @@ def cmd_pf_add(args: argparse.Namespace) -> int:
             if g == guest_port:
                 print(f"Guest port {guest_port} is already forwarded from host {h}.")
                 return 0
-        # If no host port given, we will resolve it at start time (one-to-one or random)
-        # For now, we store it with a special marker or just use guest port as host port
-        # and let the start command handle collisions.
+        # Use the guest port number as the preferred host port; collisions are
+        # resolved at start time by _find_available_port.
         forwards[guest_port] = guest_port
+        host_port = guest_port
         print(f"Added forward: guest {guest_port} (host port will be resolved at start).")
 
     save_config(config)
-    print("Run 'docker-vm restart' to apply the change.")
+
+    # If the VM is already running, try to apply the forward live via SSH tunnel.
+    pid = get_qemu_pid()
+    if pid is not None:
+        runtime_state = load_state()
+        ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
+        key_path = _ssh_key_path()
+        actual_host = _find_available_port(int(host_port))
+        tunnel_pid = _start_ssh_tunnel(actual_host, int(guest_port), ssh_port, key_path)
+        if tunnel_pid is not None:
+            tunnels = _load_tunnels()
+            tunnels[str(actual_host)] = tunnel_pid
+            _save_tunnels(tunnels)
+            print(f"Live tunnel established: host {actual_host} -> guest {guest_port} (PID {tunnel_pid}).")
+        else:
+            print("Warning: VM is running but live tunnel could not be established.")
+            print("Run 'docker-vm restart' to apply the forward at next boot.")
+    else:
+        print("Run 'docker-vm start' (or 'docker-vm restart') to apply the forward.")
     return 0
 
 
@@ -1285,7 +1394,15 @@ def cmd_pf_rm(args: argparse.Namespace) -> int:
     del forwards[host_port]
     save_config(config)
     print(f"Removed forward for host port {host_port}.")
-    print("Run 'docker-vm restart' to apply the change.")
+
+    # If the VM is running, tear down the live SSH tunnel for this port.
+    tunnels = _load_tunnels()
+    if host_port in tunnels:
+        _stop_ssh_tunnel(tunnels.pop(host_port))
+        _save_tunnels(tunnels)
+        print(f"Live tunnel for host port {host_port} has been torn down.")
+    elif get_qemu_pid() is not None:
+        print("Note: Run 'docker-vm restart' if the forward was active at boot time.")
     return 0
 
 
@@ -1370,6 +1487,53 @@ def cmd_destroy(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Shell integration
+# ---------------------------------------------------------------------------
+
+def cmd_shell_setup(args: argparse.Namespace) -> int:
+    """Print shell hook code to integrate docker-vm into the user's shell."""
+    shell = os.environ.get("SHELL", "/bin/bash")
+    rc_file = "~/.zshrc" if "zsh" in shell else "~/.bashrc"
+
+    hook = '''# docker-vm shell integration
+# Automatically activates DOCKER_HOST when the VM is running.
+_docker_vm_activate() {
+  if command -v docker-vm &>/dev/null; then
+    if docker-vm status --json 2>/dev/null | grep -q '"ready": true'; then
+      eval "$(docker-vm env 2>/dev/null)"
+    fi
+  fi
+}
+_docker_vm_activate'''
+
+    if getattr(args, "write", False):
+        rc_path = Path(rc_file).expanduser()
+        marker_start = "# docker-vm shell integration"
+        try:
+            existing = rc_path.read_text() if rc_path.exists() else ""
+        except OSError as e:
+            print(f"Error reading {rc_path}: {e}", file=sys.stderr)
+            return 1
+        if marker_start in existing:
+            print(f"Shell integration already present in {rc_file}. No changes made.")
+            return 0
+        try:
+            with rc_path.open("a") as f:
+                f.write(f"\n{hook}\n")
+            print(f"Shell integration appended to {rc_file}.")
+            print(f"Run 'source {rc_file}' or open a new shell to activate.")
+        except OSError as e:
+            print(f"Error writing {rc_path}: {e}", file=sys.stderr)
+            return 1
+    else:
+        print(f"# Paste the following block into {rc_file}")
+        print(f"# or run: docker-vm shell-setup --write")
+        print()
+        print(hook)
+    return 0
+
+
 def _print_ssh_instructions(ssh_port: int, key_path: Path) -> None:
     # Check if key is loaded in agent or configured in ~/.ssh/config
     key_configured = False
@@ -1447,6 +1611,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_start = sub.add_parser("start", help="Boot the VM")
     p_start.add_argument("--no-wait", action="store_true", help="Don't wait for guest to be ready")
+    p_start.add_argument("--cpus", type=int, help=f"Number of vCPUs (default: {DEFAULT_CPUS})")
+    p_start.add_argument("--memory", help=f"RAM allocation, e.g. 8G (default: {DEFAULT_MEMORY})")
     p_start.set_defaults(func=cmd_start)
 
     sub.add_parser("stop", help="Stop the VM").set_defaults(func=cmd_stop)
@@ -1492,6 +1658,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_destroy.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
     p_destroy.set_defaults(func=cmd_destroy)
 
+    p_shell_setup = sub.add_parser("shell-setup", help="Print or write shell hook to auto-activate DOCKER_HOST")
+    p_shell_setup.add_argument("--write", action="store_true", help="Append the hook directly to your shell RC file (~/.bashrc or ~/.zshrc)")
+    p_shell_setup.set_defaults(func=cmd_shell_setup)
+
     return parser
 
 
@@ -1503,3 +1673,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
