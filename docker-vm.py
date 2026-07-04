@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import shutil
+import shlex
 import signal
 import socket
 import subprocess
@@ -505,6 +506,8 @@ def build_cloud_init_iso(iso_path: Path) -> None:
     pub_key = Path(str(key_path) + ".pub").read_text().strip()
 
     user_data = CLOUD_INIT_USER_DATA
+    if not user_data.endswith("\n"):
+        user_data += "\n"
     user_data += "ssh_authorized_keys:\n"
     user_data += f"  - {pub_key}\n"
 
@@ -1014,6 +1017,8 @@ def cmd_docker(args: argparse.Namespace) -> int:
 
     # We use 'ssh' to run the docker command on the guest.
     # This ensures we use our SSH key for authentication.
+    # We use shlex.join to properly escape arguments for the remote shell.
+    remote_cmd = shlex.join(["docker", *docker_args])
     cmd = [
         "ssh",
         "-p", str(ssh_port),
@@ -1021,7 +1026,7 @@ def cmd_docker(args: argparse.Namespace) -> int:
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         f"{SSH_USER}@localhost",
-        "docker", *docker_args
+        remote_cmd
     ]
     if sys.stdin.isatty():
         cmd.insert(1, "-t")
