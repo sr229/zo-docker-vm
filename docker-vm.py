@@ -1069,12 +1069,22 @@ def cmd_restart(args: argparse.Namespace) -> int:
     return cmd_start(start_args)
 
 
+# Exit codes for `docker-vm status`, meant to be stable for scripting.
+STATUS_EXIT_READY = 0
+STATUS_EXIT_NOT_RUNNING = 1
+STATUS_EXIT_NOT_READY = 2
+
+
 def cmd_status(args: argparse.Namespace) -> int:
+    as_json = getattr(args, "json", False)
     pid = get_qemu_pid()
+
     if pid is None:
-        print("Docker VM is not running.")
-        return 1
-    print(f"Docker VM is running (PID {pid}).")
+        if as_json:
+            print(json.dumps({"running": False, "pid": None}, indent=2))
+        else:
+            print("Docker VM is not running.")
+        return STATUS_EXIT_NOT_RUNNING
 
     runtime_state = load_state()
     ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
@@ -1083,14 +1093,37 @@ def cmd_status(args: argparse.Namespace) -> int:
     ssh_open = False
     try:
         with socket.create_connection(("127.0.0.1", ssh_port), timeout=2.0):
-            print(f"SSH tunnel (port {ssh_port}): open")
             ssh_open = True
     except OSError:
-        print(f"SSH tunnel (port {ssh_port}): not yet accepting connections")
+        pass
 
     docker_ready = False
     if ssh_open:
         docker_ready = _check_docker_ready()
+
+    forwards = runtime_state.get("port_forwards", {})
+    ready = bool(pid and ssh_open and docker_ready)
+
+    if as_json:
+        print(json.dumps({
+            "running": True,
+            "pid": pid,
+            "ssh_port": ssh_port,
+            "ssh_open": ssh_open,
+            "docker_ready": docker_ready,
+            "docker_host": docker_host,
+            "port_forwards": forwards,
+            "ready": ready,
+        }, indent=2))
+        return STATUS_EXIT_READY if ready else STATUS_EXIT_NOT_READY
+
+    print(f"Docker VM is running (PID {pid}).")
+    if ssh_open:
+        print(f"SSH tunnel (port {ssh_port}): open")
+    else:
+        print(f"SSH tunnel (port {ssh_port}): not yet accepting connections")
+
+    if ssh_open:
         if docker_ready:
             print("Docker daemon: ready")
         else:
@@ -1099,13 +1132,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("Docker daemon reachable via:")
     print(f"  export DOCKER_HOST={docker_host}")
 
-    forwards = runtime_state.get("port_forwards", {})
     if forwards:
         print("Port forwards (HOST -> GUEST):")
         for g, h in forwards.items():
             print(f"  {h} -> {g}")
 
-    return 0 if (pid and ssh_open and docker_ready) else 1
+    return STATUS_EXIT_READY if ready else STATUS_EXIT_NOT_READY
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
@@ -1159,20 +1191,39 @@ def cmd_logs(args: argparse.Namespace) -> int:
         print(f"Log file not found at {log_path}.")
         return 1
     if args.follow:
-        # Pure-Python tail: poll the file for new bytes.
-        with log_path.open("rb") as f:
+        # Pure-Python tail: poll the file for new bytes. Also detects
+        # truncation/rotation (e.g. the VM was restarted and QEMU
+        # recreated the log file) so we don't stall at a stale offset.
+        print(f"Tailing {log_path} (Ctrl-C to stop)...")
+        f = log_path.open("rb")
+        try:
             f.seek(0, os.SEEK_END)
-            print(f"Tailing {log_path} (Ctrl-C to stop)...")
-            try:
-                while True:
-                    line = f.readline()
-                    if not line:
-                        time.sleep(0.25)
-                        continue
+            inode = os.fstat(f.fileno()).st_ino
+            while True:
+                line = f.readline()
+                if line:
                     sys.stdout.write(line.decode("utf-8", errors="replace"))
                     sys.stdout.flush()
-            except KeyboardInterrupt:
-                pass
+                    continue
+
+                try:
+                    st = log_path.stat()
+                except OSError:
+                    time.sleep(0.25)
+                    continue
+
+                if st.st_ino != inode or st.st_size < f.tell():
+                    f.close()
+                    f = log_path.open("rb")
+                    inode = os.fstat(f.fileno()).st_ino
+                    print(f"\n--- {log_path} was rotated/truncated; resuming from start ---")
+                    continue
+
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            f.close()
         return 0
     print(log_path.read_text(errors="replace"))
     return 0
@@ -1227,6 +1278,9 @@ def cmd_pf_rm(args: argparse.Namespace) -> int:
 def cmd_pf_list(args: argparse.Namespace) -> int:
     config = ensure_config()
     forwards = config.get("port_forwards", {})
+    if getattr(args, "json", False):
+        print(json.dumps({"port_forwards": forwards}, indent=2))
+        return 0
     if not forwards:
         print("No port forwards configured.")
         return 0
@@ -1345,7 +1399,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_restart = sub.add_parser("restart", help="Restart the VM")
     p_restart.add_argument("--no-wait", action="store_true", help="Don't wait for guest to be ready")
     p_restart.set_defaults(func=cmd_restart)
-    sub.add_parser("status", help="Check VM and SSH tunnel status").set_defaults(func=cmd_status)
+    p_status = sub.add_parser("status", help="Check VM and SSH tunnel status")
+    p_status.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    p_status.set_defaults(func=cmd_status)
     sub.add_parser("shell", help="Open an interactive SSH shell in the guest").set_defaults(func=cmd_shell)
     sub.add_parser("env", help="Print environment variables for the host shell").set_defaults(func=cmd_env)
 
@@ -1370,6 +1426,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pf_rm.set_defaults(func=cmd_pf_rm)
 
     p_pf_ls = p_pf_sub.add_parser("ls", help="List port forwards")
+    p_pf_ls.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     p_pf_ls.set_defaults(func=cmd_pf_list)
 
     p_resize = sub.add_parser("resize", help="Resize the VM disk")
