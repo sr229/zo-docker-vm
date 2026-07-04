@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import shutil
+import shlex
 import signal
 import socket
 import subprocess
@@ -103,6 +104,24 @@ def _pid_file(state: Path) -> Path:
     return state / "docker-vm.pid"
 
 
+def _ssh_key_path() -> Path:
+    return STATE_DIR / "id_ed25519"
+
+
+def _ensure_ssh_key() -> Path:
+    """Ensure an SSH keypair exists in the state directory for VM access."""
+    key_path = _ssh_key_path()
+    if not key_path.exists():
+        print("Generating SSH key for VM access...")
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        # We use -q to stay quiet, and -N "" for no passphrase.
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-q"],
+            check=True
+        )
+    return key_path
+
+
 # (EFI source resolution lives in _resolve_efi_source below.)
 
 
@@ -129,7 +148,7 @@ DOCKER_HOST_URL = f"ssh://{SSH_USER}@localhost:{SSH_TUNNEL_PORT}"
 # Runtime state for the currently running VM
 STATE_FILE = STATE_DIR / "state.json"
 
-BOOT_TIMEOUT_S = 90
+BOOT_TIMEOUT_S = 300
 BOOT_POLL_INTERVAL_S = 1.0
 
 DEFAULT_IMAGE_URL = (
@@ -481,7 +500,18 @@ def download_image(url: str, dest: Path) -> None:
 
 def build_cloud_init_iso(iso_path: Path) -> None:
     iso_path.parent.mkdir(parents=True, exist_ok=True)
-    USER_DATA_FILE.write_text(CLOUD_INIT_USER_DATA)
+
+    # Generate/ensure SSH key and inject it into user-data
+    key_path = _ensure_ssh_key()
+    pub_key = Path(str(key_path) + ".pub").read_text().strip()
+
+    user_data = CLOUD_INIT_USER_DATA
+    if not user_data.endswith("\n"):
+        user_data += "\n"
+    user_data += "ssh_authorized_keys:\n"
+    user_data += f"  - {pub_key}\n"
+
+    USER_DATA_FILE.write_text(user_data)
     if not shutil.which("cloud-localds"):
         print("Error: cloud-localds is not installed.", file=sys.stderr)
         sys.exit(1)
@@ -658,25 +688,57 @@ def _find_available_port(preferred: int) -> int:
 def _check_docker_ready() -> bool:
     """Check if the Docker daemon is responding via the SSH tunnel."""
     try:
-        env = os.environ.copy()
         # Use the port from the runtime state if available
         runtime_state = load_state()
         ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
-        docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+        key_path = _ssh_key_path()
 
-        env["DOCKER_HOST"] = docker_host
-        # We use 'docker version' as a lightweight health check.
-        # It verifies both the SSH connection and the Docker daemon.
+        # We use 'ssh' directly to probe the Docker daemon on the guest.
+        # This avoids issues with the local docker client trying to use
+        # default SSH keys or prompting for passwords.
+        cmd = [
+            "ssh",
+            "-p", str(ssh_port),
+            "-i", str(key_path),
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            f"{SSH_USER}@localhost",
+            "docker version --format '{{.Server.Version}}'"
+        ]
         result = subprocess.run(
-            ["docker", "version", "--format", "{{.Server.Version}}"],
-            env=env,
+            cmd,
             capture_output=True,
             text=True,
-            timeout=10  # Increased timeout to be more robust
+            timeout=15
         )
         return result.returncode == 0 and bool(result.stdout.strip())
     except Exception:
         return False
+
+
+def _check_dependencies() -> None:
+    """Ensure all required external commands are installed."""
+    deps = {
+        QEMU_BIN: "qemu-system-aarch64 (part of qemu-system-arm)",
+        "qemu-img": "qemu-img (part of qemu-utils)",
+        "cloud-localds": "cloud-localds (part of cloud-image-utils)",
+        "ssh": "ssh (part of openssh-client)",
+        "docker": "docker (part of docker.io)",
+    }
+    missing = []
+    for cmd, pkg in deps.items():
+        if not shutil.which(cmd):
+            missing.append(pkg)
+
+    if missing:
+        print("Error: The following required dependencies are missing:", file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        print("\nPlease install them using your package manager, e.g.:", file=sys.stderr)
+        print("  sudo apt install qemu-system-arm qemu-utils cloud-image-utils openssh-client docker.io", file=sys.stderr)
+        sys.exit(1)
 
 
 def _wait_for_ready(port: int, timeout_s: float = BOOT_TIMEOUT_S) -> bool:
@@ -781,6 +843,7 @@ def _init_vm(
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    _check_dependencies()
     config = ensure_config()
     image_path = Path(config["image_path"])
     if image_path.exists() and not args.force:
@@ -794,6 +857,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    _check_dependencies()
     config = ensure_config()
     image_path = Path(config["image_path"])
     if not image_path.exists():
@@ -804,8 +868,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         print("EFI pflash missing; rebuilding...")
         ensure_efi_pflash()
 
-    if not CLOUD_INIT_ISO.exists():
-        print("cloud-init ISO missing; rebuilding...")
+    if not CLOUD_INIT_ISO.exists() or not _ssh_key_path().exists():
+        print("cloud-init ISO or SSH key missing; rebuilding...")
         build_cloud_init_iso(CLOUD_INIT_ISO)
 
     wait = not getattr(args, "no_wait", False)
@@ -928,9 +992,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_shell(args: argparse.Namespace) -> int:
     runtime_state = load_state()
     ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
+    key_path = _ssh_key_path()
     cmd = [
         "ssh",
         "-p", str(ssh_port),
+        "-i", str(key_path),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         f"{SSH_USER}@localhost",
@@ -947,11 +1013,24 @@ def cmd_docker(args: argparse.Namespace) -> int:
 
     runtime_state = load_state()
     ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
-    docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+    key_path = _ssh_key_path()
 
-    env = os.environ.copy()
-    env["DOCKER_HOST"] = docker_host
-    return subprocess.call(["docker", *docker_args], env=env)
+    # We use 'ssh' to run the docker command on the guest.
+    # This ensures we use our SSH key for authentication.
+    # We use shlex.join to properly escape arguments for the remote shell.
+    remote_cmd = shlex.join(["docker", *docker_args])
+    cmd = [
+        "ssh",
+        "-p", str(ssh_port),
+        "-i", str(key_path),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        f"{SSH_USER}@localhost",
+        remote_cmd
+    ]
+    if sys.stdin.isatty():
+        cmd.insert(1, "-t")
+    return subprocess.call(cmd)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -1066,6 +1145,8 @@ def cmd_destroy(args: argparse.Namespace) -> int:
         EFI_PFLASH,
         PID_FILE,
         CONFIG_FILE,
+        _ssh_key_path(),
+        Path(str(_ssh_key_path()) + ".pub"),
     ]:
         if p.exists():
             paths_to_remove.append(p)
@@ -1105,9 +1186,12 @@ def cmd_env(args: argparse.Namespace) -> int:
     runtime_state = load_state()
     ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
     docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
+    key_path = _ssh_key_path()
 
     print(f"export DOCKER_HOST={docker_host}")
     print(f"export DOCKER_VM_WORKSPACE={_workspace()}")
+    print(f"# To use the local docker client without a password, run:")
+    print(f"# ssh-add {key_path}")
     return 0
 
 
