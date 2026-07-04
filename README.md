@@ -1,139 +1,158 @@
 # 🐳 Zo-Docker: Docker in gVisor via ARM64 QEMU
 
-Zo-Docker allows you to run a full Docker daemon inside a Zo Computer sandbox by leveraging QEMU TCG emulation to create a secure ARM64 Virtual Machine.
+Zo-Docker allows you to run a full Docker daemon inside a Zo Computer sandbox. Because gVisor restricts several system calls and mounts required by Docker (such as `iptables` and loop devices), Zo-Docker bridges this gap by launching a secure, emulated ARM64 Virtual Machine via QEMU TCG and forwarding Docker API commands over a local SSH tunnel.
+
+---
+
+## 🏗️ Architecture & Network Layout
+
+```
+                  ┌──────────────────────────────────────────────┐
+                  │                 Host Sandbox                 │
+                  │                                              │
+                  │  ┌──────────────┐      ┌──────────────────┐  │
+                  │  │  Docker CLI  │ ───> │ SSH Port Forward │  │
+                  │  └──────────────┘      │   (Port 2222)    │  │
+                  └────────────────────────┴────────┬─────────┴──┘
+                                                    │
+                                        (SSH Tunnel over localhost)
+                                                    │
+                                                    ▼
+                  ┌──────────────────────────────────────────────┐
+                  │                  Guest VM                    │
+                  │                                              │
+                  │  ┌──────────────┐      ┌──────────────────┐  │
+                  │  │  SSH Server  │ ───> │  Docker Daemon   │  │
+                  │  └──────────────┘      └──────────────────┘  │
+                  └──────────────────────────────────────────────┘
+```
+
+* **Tunnel Port:** Local port `2222` is mapped to guest port `22` (SSH) by default.
+* **Storage Mounting:** Host workspace paths (e.g. `/home/workspace`) are mapped so you can mount host directories directly into containers.
+
+---
 
 ## 🚀 Quick Start
 
-1. **Install the tool**: The whole manager is one Python file. Symlink it onto your `PATH`:
-   ```bash
-   ln -sf /home/workspace/zo-docker-vm/docker-vm.py /usr/local/bin/docker-vm
-   ```
-2. **Initialize the VM** (downloads the ARM64 cloud image and prepares cloud-init):
-   ```bash
-   docker-vm init
-   ```
-3. **Start the VM** and wait for it to come up:
-   ```bash
-   docker-vm start --wait
-   ```
-4. **Use Docker**:
-   ```bash
-   eval "$(docker-vm env)"
-   docker run hello-world
-   ```
-
-## 📦 Requirements
-
-### System packages
-
-| Tool | Why |
-| :--- | :--- |
-| `qemu-system-aarch64` | The ARM64 VM emulator |
-| `qemu-img` | Disk image creation and resizing |
-| `cloud-localds` | Builds the cloud-init ISO (from the `cloud-image-utils` package) |
-| `ssh` | Talks to the guest over the SSH tunnel |
-| `docker` (client) | For `docker-vm docker <args...>` |
-
-On Debian/Ubuntu:
+### 1. Install the tool
+Symlink the Python manager script onto your `PATH`:
 ```bash
-apt install qemu-system-arm qemu-utils cloud-image-utils openssh-client docker.io
+ln -sf /home/workspace/zo-docker-vm/docker-vm.py /usr/local/bin/docker-vm
 ```
 
-### Python packages
-
-`docker-vm` is pure Python 3.10+ and only needs two third-party libraries. Both are pre-installed on the base Zo Computer image, so no action is required there. If you run the script elsewhere:
-
+### 2. Initialize the VM
+Downloads the pre-configured ARM64 cloud image and prepares the cloud-init environment:
 ```bash
-pip install psutil requests
+docker-vm init
 ```
 
-`psutil` is used for cross-platform process management (replaces `pkill`/`pgrep`/`kill`).
-`requests` is used for HTTP downloads with progress reporting. If it is missing, the script transparently falls back to `urllib` from the standard library.
-
-## 📂 State directory
-
-All persistent state (qcow2 disk image, EFI pflash, cloud-init ISO, config, log, PID) lives in a single self-contained directory, so the host `$HOME` stays clean. By default that directory is:
-
+### 3. Start the VM
+Starts the QEMU emulator. By default, this blocks until the guest OS and the Docker daemon inside the VM are fully ready:
+```bash
+docker-vm start
 ```
+
+### 4. Use Docker
+You can interact with the Docker daemon in two ways:
+
+* **Method A: Via the CLI Wrapper (No config needed)**
+  Simply prefix your commands with `docker-vm docker`:
+  ```bash
+  docker-vm docker run hello-world
+  ```
+* **Method B: Via the Native Docker CLI**
+  Set up the host environment variables to route native `docker` commands through the SSH tunnel:
+  ```bash
+  eval "$(docker-vm env)"
+  docker run hello-world
+  ```
+  *Note: To use the native CLI, you must authorize the VM's SSH key. See [SSH Authorization](#-ssh-authorization) below.*
+
+---
+
+## 🔑 SSH Authorization
+
+The native `docker` CLI communicates with the guest VM over SSH. Because the private key is stored in a non-standard location (`~/.local/state/docker-vm/id_ed25519`), you must tell your local SSH client how to locate it.
+
+Choose **one** of the following methods to authorize the key:
+
+### Method A: SSH Configuration File (Recommended - Persistent)
+Append the following block to your local SSH configuration file ([~/.ssh/config](file:///root/.ssh/config)). This ensures `ssh` always uses the correct identity and flags when connecting to the VM:
+```text
+Host localhost
+  Port 2222
+  IdentityFile ~/.local/state/docker-vm/id_ed25519
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+```
+
+### Method B: SSH Agent (Temporary - Session-scoped)
+Start the authentication agent and add the key to your current shell session:
+```bash
+eval $(ssh-agent)
+ssh-add ~/.local/state/docker-vm/id_ed25519
+```
+
+---
+
+## 📂 State Directory & Configuration
+
+All VM state files (disk image, EFI flashes, metadata, log files, and keys) are kept in a single directory to prevent pollution of your `$HOME` folder:
+
+```text
 $XDG_STATE_HOME/docker-vm       # if $XDG_STATE_HOME is set
 ~/.local/state/docker-vm        # otherwise
 ```
 
-Override it with `$DOCKER_VM_STATE_DIR` to put the VM somewhere else (for example, a second disk or a shared volume):
-
+To use a custom directory (e.g., to place the VM on a secondary block storage or shared drive), set the `$DOCKER_VM_STATE_DIR` variable:
 ```bash
 DOCKER_VM_STATE_DIR=/mnt/docker-vm docker-vm init
 ```
 
-Nothing else is written to your home directory. Legacy installs that still have `/home/workspace/.docker-vm.json` are detected on first run and migrated into the state directory automatically (the old file is renamed to `.docker-vm.json.bak`).
-
-### Environment variables (all optional)
-
-| Variable | Default | Purpose |
-| :--- | :--- | :--- |
-| `DOCKER_VM_STATE_DIR` | `$XDG_STATE_HOME/docker-vm` or `~/.local/state/docker-vm` | Where the qcow2, EFI, ISO, log, and config live |
-| `DOCKER_VM_WORKSPACE` | `/home/workspace` | Host workspace path; printed by `docker-vm env` so the guest can mount the same path |
-| `DOCKER_VM_EFI` | first match in well-known paths | Path to a `QEMU_EFI.fd` / `AAVMF_CODE.fd` file |
-| `XDG_STATE_HOME` | n/a | XDG base directory spec; if set, used as the state-dir parent |
-| `XDG_RUNTIME_DIR` | n/a | XDG base directory spec; if set, the PID file lives here as a tmpfs |
-
-## 🛠️ Commands
-
-| Command | Description |
-| :--- | :--- |
-| `docker-vm init [--image URL] [--size SIZE] [--force]` | Download image, prepare cloud-init ISO |
-| `docker-vm start [--wait]` | Boot the VM (`--wait` blocks until SSH is ready) |
-| `docker-vm stop` | Stop the VM |
-| `docker-vm restart` | Restart the VM (waits for SSH) |
-| `docker-vm status` | Check if the VM and SSH tunnel are up |
-| `docker-vm shell` | Open an interactive SSH shell in the guest |
-| `docker-vm env` | Print `export DOCKER_HOST=...` for the host shell |
-| `docker-vm docker <args...>` | Run a docker command against the VM |
-| `docker-vm logs [-f]` | Show or tail the QEMU log |
-| `docker-vm pf add <host> <guest>` | Add a port forward |
-| `docker-vm pf rm <host>` | Remove a port forward |
-| `docker-vm pf ls` | List port forwards |
-| `docker-vm resize <size>` | Resize the VM disk (e.g., `100G`) |
-| `docker-vm destroy [-y]` | Wipe the state directory and start over |
-
-## 🏗️ Architecture
-
-`docker-vm.py` is a single self-contained Python file. It deliberately uses dedicated Python libraries instead of shelling out wherever possible:
-
-| Concern | Library | Replaces |
-| :--- | :--- | :--- |
-| Process management | `psutil` | `pkill`, `pgrep`, `kill` |
-| Image downloads | `requests` (fallback: `urllib`) | `curl` |
-| File IO | `pathlib`, `shutil` (stdlib) | `rm`, `cp`, `mkdir` |
-| Networking checks | `socket` (stdlib) | `nc`, `sshpass` |
-| Log tailing | pure-Python read/poll | `tail -f` |
-| Argument parsing | `argparse` (stdlib) | hand-rolled argv parsing |
-| Path resolution | `pathlib` + XDG env vars | hard-coded paths in `$HOME` |
-
-The only external commands invoked are `qemu-img` (disk resize) and `cloud-localds` (cloud-init ISO), both of which are tiny tools with no clean Python equivalents. QEMU itself is launched via `subprocess.Popen` and its PID is tracked via `psutil` (with a `/var/run` PID file as a fallback when `XDG_RUNTIME_DIR` is unset).
-
-**Network Layout:**
-- **Host** → **SSH Tunnel (Port 2222)** → **Guest VM** → **Docker Daemon**
-
-## 🛡️ How it Works
-
-Since gVisor restricts the system calls needed for Docker (like `iptables` and specific mounts), Zo-Docker emulates an entire ARM64 machine. The Docker daemon runs inside this VM, and the host communicates with it via a secure SSH tunnel.
-
-## ⚙️ Configuration
-
-All configuration is stored in `<state-dir>/config.json` — see the [State directory](#-state-directory) section for the path. The file is automatically created on first run and persists the VM image path, log file location, and port forwards.
-
+### Configuration File (`config.json`)
+The VM's configuration is managed dynamically in `<state-dir>/config.json`. Example content:
 ```json
 {
-  "image_path": "/home/user/.local/state/docker-vm/image.qcow2",
-  "log_file": "/home/user/.local/state/docker-vm/docker-vm.log",
+  "image_path": "/root/.local/state/docker-vm/image.qcow2",
+  "image_url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
+  "disk_size": "50G",
+  "log_file": "/root/.local/state/docker-vm/docker-vm.log",
   "port_forwards": {
-    "2222": "22",
-    "8080": "80"
-  }
+    "2222": "22"
+  },
+  "workspace": "/home/workspace"
 }
 ```
 
-* `image_path`: The path to the persistent `qcow2` disk image.
-* `log_file`: Where QEMU's serial and debug output is piped.
-* `port_forwards`: A mapping of `host port -> guest port` used to build QEMU's `hostfwd` arguments at launch.
+---
+
+## 🛠️ Commands Reference
+
+| Command | Arguments | Description |
+| :--- | :--- | :--- |
+| `init` | `[--image URL/shorthand] [--size SIZE] [--force]` | Downloads the VM cloud image and creates the cloud-init environment. Supported shorthands: `docker` (default), `containerd`, `incus`, `none`. |
+| `start` | `[--no-wait]` | Launches QEMU. Blocks until Docker is ready unless `--no-wait` is supplied. |
+| `stop` | None | Gracefully stops the QEMU process. |
+| `restart` | `[--no-wait]` | Restarts the VM. |
+| `status` | `[--json]` | Shows whether the VM process, SSH tunnel, and Docker daemon are active. |
+| `shell` | None | Opens an interactive SSH shell inside the guest VM. |
+| `env` | None | Prints shell environment exports (`DOCKER_HOST`, `DOCKER_VM_WORKSPACE`) and prints SSH authorization checks. |
+| `docker` | `<args...>` | Wrapper to run any Docker command inside the guest VM. |
+| `logs` | `[-f/--follow]` | Tails the QEMU process serial and debug output log. |
+| `pf add` | `<guest_port> [host_port]` | Registers a new port forward mapping from Host to Guest VM. |
+| `pf rm` | `<host_port>` | Removes an existing port forward. |
+| `pf ls` | `[--json]` | Lists all active port forward configurations. |
+| `resize` | `<size>` | Expands the QEMU disk partition to a larger size (e.g. `100G`). |
+| `destroy` | `[-y/--yes]` | Wipes all state data, configs, and disk files in the state directory. |
+
+---
+
+## ⚙️ Environment Variables
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `DOCKER_VM_STATE_DIR` | `~/.local/state/docker-vm` | State directory containing all VM disks, keys, and logs. |
+| `DOCKER_VM_WORKSPACE` | `/home/workspace` | Host workspace directory path exposed to the guest VM. |
+| `DOCKER_VM_EFI` | System search path | Location of the `QEMU_EFI.fd` or `AAVMF_CODE.fd` binary. |
+| `XDG_STATE_HOME` | `~/.local/state` | Parent directory of the default state path. |
+| `XDG_RUNTIME_DIR` | None | Parent directory for PID storage (tmpfs) if set. |

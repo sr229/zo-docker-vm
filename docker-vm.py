@@ -999,12 +999,20 @@ def cmd_start(args: argparse.Namespace) -> int:
         if wait:
             if _check_docker_ready():
                 print("Docker daemon is already ready.")
+                print("\nTo configure your shell to use this VM, run:")
+                print('  eval "$(docker-vm env)"')
+                print("\nAlternatively, you can run docker commands via the wrapper:")
+                print("  docker-vm docker <command>")
             else:
                 runtime_state = load_state()
                 ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
                 print("Docker VM is running but daemon is not yet ready. Waiting...")
                 if _wait_for_ready(ssh_port):
                     print("Docker VM is up and ready.")
+                    print("\nTo configure your shell to use this VM, run:")
+                    print('  eval "$(docker-vm env)"')
+                    print("\nAlternatively, you can run docker commands via the wrapper:")
+                    print("  docker-vm docker <command>")
                 else:
                     print("Warning: Docker daemon did not become ready in time.")
                     return 1
@@ -1047,9 +1055,15 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"Waiting up to {BOOT_TIMEOUT_S}s for guest to be ready...")
         if _wait_for_ready(ssh_port):
             print("Docker VM is up and ready.")
+            print("\nTo configure your shell to use this VM, run:")
+            print('  eval "$(docker-vm env)"')
+            print("\nAlternatively, you can run docker commands via the wrapper:")
+            print("  docker-vm docker <command>")
             return 0
         print("Warning: guest did not become ready in time. Check logs.")
         return 1
+    else:
+        print("VM is starting in the background. Run 'docker-vm status' to check readiness.")
     return 0
 
 
@@ -1356,6 +1370,50 @@ def cmd_destroy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_ssh_instructions(ssh_port: int, key_path: Path) -> None:
+    # Check if key is loaded in agent or configured in ~/.ssh/config
+    key_configured = False
+
+    # Check ~/.ssh/config
+    ssh_config = Path("~/.ssh/config").expanduser()
+    if ssh_config.exists():
+        try:
+            content = ssh_config.read_text()
+            if str(key_path) in content or key_path.name in content:
+                key_configured = True
+        except Exception:
+            pass
+
+    # Check ssh-agent
+    if not key_configured:
+        try:
+            # Check if ssh-add -l contains our key
+            result = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and (str(key_path) in result.stdout or key_path.name in result.stdout):
+                key_configured = True
+        except Exception:
+            pass
+
+    if not key_configured:
+        print("#", file=sys.stderr)
+        print("# WARNING: The VM's SSH key is not yet authorized in your shell or SSH config.", file=sys.stderr)
+        print("# Choose one of the following methods to authorize it:", file=sys.stderr)
+        print("#", file=sys.stderr)
+        print("# Method A: Configure your SSH config file (Recommended - persistent)", file=sys.stderr)
+        print("#   Append the following block to ~/.ssh/config:", file=sys.stderr)
+        print("#", file=sys.stderr)
+        print("#     Host localhost", file=sys.stderr)
+        print(f"#       Port {ssh_port}", file=sys.stderr)
+        print(f"#       IdentityFile {key_path}", file=sys.stderr)
+        print("#       StrictHostKeyChecking no", file=sys.stderr)
+        print("#       UserKnownHostsFile /dev/null", file=sys.stderr)
+        print("#", file=sys.stderr)
+        print("# Method B: Add the key to ssh-agent (Temporary - per-session)", file=sys.stderr)
+        print("#   eval $(ssh-agent)", file=sys.stderr)
+        print(f"#   ssh-add {key_path}", file=sys.stderr)
+        print("#", file=sys.stderr)
+
+
 def cmd_env(args: argparse.Namespace) -> int:
     """Print shell commands to set up the environment."""
     runtime_state = load_state()
@@ -1365,11 +1423,8 @@ def cmd_env(args: argparse.Namespace) -> int:
 
     print(f"export DOCKER_HOST={docker_host}")
     print(f"export DOCKER_VM_WORKSPACE={_workspace()}")
-    print("#")
-    print("# To trust the VM host key and enable passwordless access from host CLI, run:")
-    print(f'# ssh-keygen -R "[localhost]:{ssh_port}" 2>/dev/null')
-    print(f"# ssh-keyscan -p {ssh_port} localhost >> ~/.ssh/known_hosts 2>/dev/null")
-    print(f"# ssh-add {key_path} 2>/dev/null")
+    
+    _print_ssh_instructions(ssh_port, key_path)
     return 0
 
 
@@ -1385,7 +1440,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="Download image and prepare cloud-init ISO")
-    p_init.add_argument("--image", help="Image URL (default: Debian cloud bookworm arm64)")
+    p_init.add_argument("--image", help="Image URL or shorthand: docker, containerd, incus, none (default: Ubuntu 24.04 minimal cloud image)")
     p_init.add_argument("--size", help="Disk size, e.g. 100G (default: 50G)")
     p_init.add_argument("--force", action="store_true", help="Re-run even if image exists")
     p_init.set_defaults(func=cmd_init)
