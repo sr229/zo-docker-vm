@@ -133,7 +133,33 @@ def _ensure_ssh_key() -> Path:
 QEMU_BIN = "qemu-system-aarch64"
 QEMU_PROCESS_NAME = "qemu-system-aarch64"
 STATE_DIR = _state_dir()
-DOCKER_SOCK = STATE_DIR / "docker.sock"
+
+
+def _docker_sock_path() -> Path:
+    """Return the path for the Docker socket.
+
+    Prefers /run/docker-vm.sock, then $XDG_RUNTIME_DIR/docker-vm.sock,
+    falling back to the state directory.
+    """
+    candidates = [
+        Path("/run/docker-vm.sock"),
+        Path("/var/run/docker-vm.sock"),
+    ]
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        candidates.append(Path(xdg_runtime) / "docker-vm.sock")
+
+    for p in candidates:
+        try:
+            # Check if we can write to the directory
+            if p.parent.exists() and os.access(p.parent, os.W_OK):
+                return p
+        except OSError:
+            continue
+    return STATE_DIR / "docker.sock"
+
+
+DOCKER_SOCK = _docker_sock_path()
 PID_FILE = _pid_file(STATE_DIR)
 EFI_PFLASH = STATE_DIR / "efi-pflash.raw"
 CLOUD_INIT_ISO = STATE_DIR / "cloud-init.iso"
