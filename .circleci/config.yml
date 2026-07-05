@@ -1,0 +1,39 @@
+version: 2.1
+
+jobs:
+  test:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - checkout
+
+      - run:
+          name: Install gVisor runtime
+          command: |
+            curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | \
+              sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+            sudo apt-get update -q
+            sudo apt-get install -y runsc
+            sudo runsc install
+            sudo systemctl reload docker
+
+      - run:
+          name: Run tests in gVisor container
+          command: |
+            docker run --runtime=runsc --rm \
+              -v "$PWD":/workspace \
+              -w /workspace \
+              python:3.10 \
+              bash -c "
+                apt-get update -q && \
+                apt-get install -y -q qemu-system-aarch64 qemu-utils cloud-image-utils openssh-client && \
+                pip install --quiet psutil requests pytest pytest-mock && \
+                qemu-img create -f qcow2 tests/dummy.qcow2 1M && \
+                pytest tests/integration_test_docker_vm.py
+              "
+
+workflows:
+  ci:
+    jobs:
+      - test
