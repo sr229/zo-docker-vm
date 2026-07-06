@@ -133,6 +133,33 @@ def _ensure_ssh_key() -> Path:
 QEMU_BIN = "qemu-system-aarch64"
 QEMU_PROCESS_NAME = "qemu-system-aarch64"
 STATE_DIR = _state_dir()
+
+
+def _docker_sock_path() -> Path:
+    """Return the path for the Docker socket.
+
+    Prefers /run/docker-vm.sock, then $XDG_RUNTIME_DIR/docker-vm.sock,
+    falling back to the state directory.
+    """
+    candidates = [
+        Path("/run/docker-vm.sock"),
+        Path("/var/run/docker-vm.sock"),
+    ]
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        candidates.append(Path(xdg_runtime) / "docker-vm.sock")
+
+    for p in candidates:
+        try:
+            # Check if we can write to the directory
+            if p.parent.exists() and os.access(p.parent, os.W_OK):
+                return p
+        except OSError:
+            continue
+    return STATE_DIR / "docker.sock"
+
+
+DOCKER_SOCK = _docker_sock_path()
 PID_FILE = _pid_file(STATE_DIR)
 EFI_PFLASH = STATE_DIR / "efi-pflash.raw"
 CLOUD_INIT_ISO = STATE_DIR / "cloud-init.iso"
@@ -183,6 +210,13 @@ def _default_config() -> dict[str, Any]:
             str(SSH_TUNNEL_PORT): str(SSH_GUEST_PORT),
         },
         "workspace": str(workspace),
+        "mounts": [
+            {
+                "host_path": str(workspace),
+                "guest_path": str(workspace),
+                "readonly": False,
+            }
+        ],
     }
 
 
@@ -576,11 +610,22 @@ def build_cloud_init_iso(iso_path: Path) -> None:
     key_path = _ensure_ssh_key()
     pub_key = Path(str(key_path) + ".pub").read_text().strip()
 
+    config = load_config()
+    mounts = config.get("mounts", [])
+
     user_data = CLOUD_INIT_USER_DATA
     if not user_data.endswith("\n"):
         user_data += "\n"
     user_data += "ssh_authorized_keys:\n"
     user_data += f"  - {pub_key}\n"
+
+    if mounts:
+        user_data += "mounts:\n"
+        for i, m in enumerate(mounts):
+            tag = f"mount{i}"
+            guest_path = m["guest_path"]
+            # [ source, mountpoint, filesystem, options, dump, fsck ]
+            user_data += f"  - [ {tag}, {guest_path}, 9p, 'trans=virtio,version=9p2000.L', 0, 0 ]\n"
 
     USER_DATA_FILE.write_text(user_data)
     if not shutil.which("cloud-localds"):
@@ -743,6 +788,24 @@ def build_qemu_command(config: dict[str, Any]) -> tuple[list[str], dict[str, int
         "-serial", "mon:stdio",
         "-D", str(log_file),
     ]
+
+    # Add directory mounts via virtfs (9p)
+    mounts = config.get("mounts", [])
+    for i, m in enumerate(mounts):
+        host_path = Path(m["host_path"]).expanduser()
+        if not host_path.exists():
+            print(f"  Warning: host mount path {host_path} does not exist; skipping.")
+            continue
+
+        tag = f"mount{i}"
+        security_model = "none" # Use 'none' for simplicity and to avoid permission issues with mapped-xattr
+        readonly = "on" if m.get("readonly") else "off"
+
+        cmd.extend([
+            "-virtfs",
+            f"local,path={host_path},mount_tag={tag},security_model={security_model},readonly={readonly}"
+        ])
+
     return cmd, resolved_forwards
 
 
@@ -1003,8 +1066,26 @@ def _save_tunnels(tunnels: dict[str, int]) -> None:
     TUNNELS_FILE.write_text(json.dumps(tunnels, indent=2))
 
 
-def _start_ssh_tunnel(host_port: int, guest_port: int, ssh_port: int, key_path: Path) -> int | None:
-    """Spawn a background SSH tunnel and return its PID, or None on failure."""
+def _start_ssh_tunnel(local: str | int, remote: str | int, ssh_port: int, key_path: Path) -> int | None:
+    """Spawn a background SSH tunnel and return its PID, or None on failure.
+
+    Supports both TCP (int) and Unix socket (str) forwarding.
+    """
+    if isinstance(local, str) and os.path.exists(local):
+        try:
+            os.unlink(local)
+        except OSError:
+            pass
+
+    forward_arg = f"{local}:localhost:{remote}"
+    if isinstance(local, str) and "/" in local:
+        # For Unix socket forwarding, we need to use a slightly different syntax
+        # and ensure the remote side is also treated as a socket if it looks like a path.
+        if isinstance(remote, str) and "/" in remote:
+            forward_arg = f"{local}:{remote}"
+        else:
+            forward_arg = f"{local}:localhost:{remote}"
+
     cmd = [
         "ssh",
         "-N",
@@ -1014,7 +1095,8 @@ def _start_ssh_tunnel(host_port: int, guest_port: int, ssh_port: int, key_path: 
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ExitOnForwardFailure=yes",
-        "-L", f"{host_port}:localhost:{guest_port}",
+        "-o", "StreamLocalBindUnlink=yes",
+        "-L", forward_arg,
         f"{SSH_USER}@localhost",
     ]
     try:
@@ -1141,6 +1223,28 @@ def cmd_start(args: argparse.Namespace) -> int:
     write_pid_file(proc.pid)
     print(f"QEMU started with PID {proc.pid}. Logs: {log_path}")
 
+    # Start Docker socket tunnel
+    ssh_port = resolved_ports.get(str(SSH_GUEST_PORT), SSH_TUNNEL_PORT)
+    key_path = _ssh_key_path()
+    print("Starting Docker socket tunnel...")
+    socket_tunnel_pid = _start_ssh_tunnel(str(DOCKER_SOCK), "/var/run/docker.sock", ssh_port, key_path)
+    if socket_tunnel_pid:
+        tunnels = _load_tunnels()
+        tunnels[str(DOCKER_SOCK)] = socket_tunnel_pid
+        _save_tunnels(tunnels)
+        print(f"  Docker socket tunnel started (PID {socket_tunnel_pid}).")
+        # Try to update Docker context
+        try:
+            subprocess.run(
+                ["docker", "context", "create", "zo-docker", "--docker", f"host=unix://{DOCKER_SOCK}", "--description", "Zo-Docker VM"],
+                capture_output=True, text=True
+            )
+            subprocess.run(["docker", "context", "update", "zo-docker", "--docker", f"host=unix://{DOCKER_SOCK}"], capture_output=True, text=True)
+        except Exception:
+            pass
+    else:
+        print("  Warning: could not start Docker socket tunnel.")
+
     if wait:
         print(f"Waiting up to {BOOT_TIMEOUT_S}s for guest to be ready...")
         if _wait_for_ready(ssh_port):
@@ -1159,6 +1263,11 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 def cmd_stop(args: argparse.Namespace) -> int:
     _stop_all_ssh_tunnels()
+    if DOCKER_SOCK.exists():
+        try:
+            DOCKER_SOCK.unlink()
+        except OSError:
+            pass
     if stop_qemu():
         print("Docker VM stopped.")
         return 0
@@ -1183,6 +1292,13 @@ STATUS_EXIT_NOT_READY = 2
 def cmd_status(args: argparse.Namespace) -> int:
     as_json = getattr(args, "json", False)
     pid = get_qemu_pid()
+
+    # Check Docker socket tunnel
+    tunnels = _load_tunnels()
+    socket_tunnel_pid = tunnels.get(str(DOCKER_SOCK))
+    socket_tunnel_alive = False
+    if socket_tunnel_pid:
+        socket_tunnel_alive = _pid_alive(socket_tunnel_pid)
 
     if pid is None:
         if as_json:
@@ -1217,6 +1333,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             "ssh_open": ssh_open,
             "docker_ready": docker_ready,
             "docker_host": docker_host,
+            "docker_sock": str(DOCKER_SOCK),
+            "docker_sock_alive": socket_tunnel_alive,
             "port_forwards": forwards,
             "ready": ready,
         }, indent=2))
@@ -1234,8 +1352,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         else:
             print("Docker daemon: not yet responding")
 
+    if socket_tunnel_alive:
+        print(f"Docker socket tunnel: active ({DOCKER_SOCK})")
+    else:
+        print("Docker socket tunnel: inactive")
+
     print("Docker daemon reachable via:")
-    print(f"  export DOCKER_HOST={docker_host}")
+    print(f"  export DOCKER_HOST=unix://{DOCKER_SOCK}")
+    print(f"  # OR: docker context use zo-docker")
 
     if forwards:
         print("Port forwards (HOST -> GUEST):")
@@ -1367,7 +1491,7 @@ def cmd_pf_add(args: argparse.Namespace) -> int:
         ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
         key_path = _ssh_key_path()
         actual_host = _find_available_port(int(host_port))
-        tunnel_pid = _start_ssh_tunnel(actual_host, int(guest_port), ssh_port, key_path)
+        tunnel_pid = _start_ssh_tunnel(int(actual_host), int(guest_port), ssh_port, key_path)
         if tunnel_pid is not None:
             tunnels = _load_tunnels()
             tunnels[str(actual_host)] = tunnel_pid
@@ -1419,6 +1543,67 @@ def cmd_pf_list(args: argparse.Namespace) -> int:
     print(f"{'-' * 8} {'-' * 8}")
     for host, guest in forwards.items():
         print(f"{host:<8} {guest:<8}")
+    return 0
+
+
+def cmd_mount_add(args: argparse.Namespace) -> int:
+    config = ensure_config()
+    mounts = config.setdefault("mounts", [])
+
+    host_path = str(Path(args.host).absolute())
+    guest_path = args.guest
+    readonly = getattr(args, "readonly", False)
+
+    # Check for duplicates
+    for m in mounts:
+        if m["host_path"] == host_path and m["guest_path"] == guest_path:
+            print(f"Mount {host_path} -> {guest_path} already exists.")
+            return 0
+
+    mounts.append({
+        "host_path": host_path,
+        "guest_path": guest_path,
+        "readonly": readonly,
+    })
+    save_config(config)
+    print(f"Added mount: {host_path} -> {guest_path} ({'readonly' if readonly else 'read-write'}).")
+    print("Run 'docker-vm restart' to apply the new mount.")
+    return 0
+
+
+def cmd_mount_rm(args: argparse.Namespace) -> int:
+    config = ensure_config()
+    mounts = config.get("mounts", [])
+
+    initial_len = len(mounts)
+    guest_path = args.guest
+
+    config["mounts"] = [m for m in mounts if m["guest_path"] != guest_path]
+
+    if len(config["mounts"]) == initial_len:
+        print(f"No mount found for guest path {guest_path}.")
+        return 1
+
+    save_config(config)
+    print(f"Removed mount for guest path {guest_path}.")
+    print("Run 'docker-vm restart' to apply the change.")
+    return 0
+
+
+def cmd_mount_list(args: argparse.Namespace) -> int:
+    config = ensure_config()
+    mounts = config.get("mounts", [])
+    if getattr(args, "json", False):
+        print(json.dumps({"mounts": mounts}, indent=2))
+        return 0
+    if not mounts:
+        print("No mounts configured.")
+        return 0
+    print(f"{'HOST PATH':<40} {'GUEST PATH':<20} {'OPTIONS':<10}")
+    print(f"{'-' * 40} {'-' * 20} {'-' * 10}")
+    for m in mounts:
+        opts = "ro" if m.get("readonly") else "rw"
+        print(f"{m['host_path']:<40} {m['guest_path']:<20} {opts:<10}")
     return 0
 
 
@@ -1582,10 +1767,9 @@ def cmd_env(args: argparse.Namespace) -> int:
     """Print shell commands to set up the environment."""
     runtime_state = load_state()
     ssh_port = runtime_state.get("ssh_port", SSH_TUNNEL_PORT)
-    docker_host = f"ssh://{SSH_USER}@localhost:{ssh_port}"
     key_path = _ssh_key_path()
 
-    print(f"export DOCKER_HOST={docker_host}")
+    print(f"export DOCKER_HOST=unix://{DOCKER_SOCK}")
     print(f"export DOCKER_VM_WORKSPACE={_workspace()}")
     
     _print_ssh_instructions(ssh_port, key_path)
@@ -1649,6 +1833,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_pf_ls = p_pf_sub.add_parser("ls", help="List port forwards")
     p_pf_ls.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     p_pf_ls.set_defaults(func=cmd_pf_list)
+
+    p_mount = sub.add_parser("mount", help="Manage directory mounts")
+    p_mount_sub = p_mount.add_subparsers(dest="mount_command", required=True)
+
+    p_mount_add = p_mount_sub.add_parser("add", help="Add a directory mount")
+    p_mount_add.add_argument("host", help="Host path")
+    p_mount_add.add_argument("guest", help="Guest path")
+    p_mount_add.add_argument("--readonly", action="store_true", help="Mount as read-only")
+    p_mount_add.set_defaults(func=cmd_mount_add)
+
+    p_mount_rm = p_mount_sub.add_parser("rm", help="Remove a directory mount")
+    p_mount_rm.add_argument("guest", help="Guest path")
+    p_mount_rm.set_defaults(func=cmd_mount_rm)
+
+    p_mount_ls = p_mount_sub.add_parser("ls", help="List directory mounts")
+    p_mount_ls.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    p_mount_ls.set_defaults(func=cmd_mount_list)
 
     p_resize = sub.add_parser("resize", help="Resize the VM disk")
     p_resize.add_argument("size", help="New size, e.g. 100G")
